@@ -10,11 +10,12 @@ pub enum AppAction {
     MoveDown,
     ProjectMoveUp,
     ProjectMoveDown,
-    StartCreateWorktreePrompt,
-    ConfirmProjectPrompt,
-    CancelProjectPrompt,
-    EditProjectPrompt(char),
-    DeleteProjectPromptChar,
+    StartCreateWorktreeInput,
+    StartCommandInput,
+    ConfirmInput,
+    CancelInput,
+    EditInput(char),
+    DeleteInputChar,
     AttachSelected,
     OpenProjectShell,
     OpenProjectEditor,
@@ -27,21 +28,19 @@ pub enum AppAction {
 pub fn action_for_key(
     active_tab: AppTab,
     mode: Mode,
-    project_prompt_active: bool,
+    input_active: bool,
     key: KeyEvent,
 ) -> Option<AppAction> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return None;
     }
 
+    if input_active {
+        return input_action(key);
+    }
+
     match active_tab {
-        AppTab::Projects => {
-            if project_prompt_active {
-                project_prompt_action(key)
-            } else {
-                project_mode_action(key)
-            }
-        }
+        AppTab::Projects => project_mode_action(key),
         AppTab::Panes => match mode {
             Mode::Normal => pane_normal_mode_action(key),
             Mode::Insert => insert_mode_action(key),
@@ -57,6 +56,7 @@ fn pane_normal_mode_action(key: KeyEvent) -> Option<AppAction> {
     match key.code {
         KeyCode::Char('1') => Some(AppAction::SwitchToProjects),
         KeyCode::Char('2') => Some(AppAction::SwitchToPanes),
+        KeyCode::Char(':') => Some(AppAction::StartCommandInput),
         KeyCode::Char('j') => Some(AppAction::MoveDown),
         KeyCode::Char('k') => Some(AppAction::MoveUp),
         KeyCode::Char('i') => Some(AppAction::AttachSelected),
@@ -70,6 +70,7 @@ fn project_mode_action(key: KeyEvent) -> Option<AppAction> {
         KeyModifiers::NONE => match key.code {
             KeyCode::Char('1') => Some(AppAction::SwitchToProjects),
             KeyCode::Char('2') => Some(AppAction::SwitchToPanes),
+            KeyCode::Char(':') => Some(AppAction::StartCommandInput),
             KeyCode::Char('j') => Some(AppAction::ProjectMoveDown),
             KeyCode::Char('k') => Some(AppAction::ProjectMoveUp),
             KeyCode::Char('q') => Some(AppAction::Quit),
@@ -79,20 +80,20 @@ fn project_mode_action(key: KeyEvent) -> Option<AppAction> {
             KeyCode::Char('t') => Some(AppAction::OpenProjectShell),
             KeyCode::Char('e') => Some(AppAction::OpenProjectEditor),
             KeyCode::Char('v') => Some(AppAction::OpenProjectGit),
-            KeyCode::Char('w') => Some(AppAction::StartCreateWorktreePrompt),
+            KeyCode::Char('w') => Some(AppAction::StartCreateWorktreeInput),
             _ => None,
         },
         _ => None,
     }
 }
 
-fn project_prompt_action(key: KeyEvent) -> Option<AppAction> {
+fn input_action(key: KeyEvent) -> Option<AppAction> {
     match key.code {
-        KeyCode::Esc => Some(AppAction::CancelProjectPrompt),
-        KeyCode::Enter => Some(AppAction::ConfirmProjectPrompt),
-        KeyCode::Backspace => Some(AppAction::DeleteProjectPromptChar),
+        KeyCode::Esc => Some(AppAction::CancelInput),
+        KeyCode::Enter => Some(AppAction::ConfirmInput),
+        KeyCode::Backspace => Some(AppAction::DeleteInputChar),
         KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
-            Some(AppAction::EditProjectPrompt(c))
+            Some(AppAction::EditInput(c))
         }
         _ => None,
     }
@@ -125,6 +126,15 @@ mod tests {
             action_for_key(AppTab::Panes, Mode::Normal, false, key),
             Some(AppAction::MoveDown)
         );
+        assert_eq!(
+            action_for_key(
+                AppTab::Panes,
+                Mode::Normal,
+                false,
+                KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE)
+            ),
+            Some(AppAction::StartCommandInput)
+        );
     }
 
     #[test]
@@ -156,6 +166,15 @@ mod tests {
 
     #[test]
     fn project_mode_maps_navigation_and_actions() {
+        assert_eq!(
+            action_for_key(
+                AppTab::Projects,
+                Mode::Insert,
+                false,
+                KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE)
+            ),
+            Some(AppAction::StartCommandInput)
+        );
         assert_eq!(
             action_for_key(
                 AppTab::Projects,
@@ -208,12 +227,12 @@ mod tests {
                 false,
                 KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)
             ),
-            Some(AppAction::StartCreateWorktreePrompt)
+            Some(AppAction::StartCreateWorktreeInput)
         );
     }
 
     #[test]
-    fn project_prompt_maps_editing_keys() {
+    fn input_mode_maps_editing_keys() {
         assert_eq!(
             action_for_key(
                 AppTab::Projects,
@@ -221,7 +240,7 @@ mod tests {
                 true,
                 KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
             ),
-            Some(AppAction::EditProjectPrompt('x'))
+            Some(AppAction::EditInput('x'))
         );
         assert_eq!(
             action_for_key(
@@ -230,7 +249,7 @@ mod tests {
                 true,
                 KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
             ),
-            Some(AppAction::DeleteProjectPromptChar)
+            Some(AppAction::DeleteInputChar)
         );
         assert_eq!(
             action_for_key(
@@ -239,7 +258,7 @@ mod tests {
                 true,
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
             ),
-            Some(AppAction::ConfirmProjectPrompt)
+            Some(AppAction::ConfirmInput)
         );
     }
 }

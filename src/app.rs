@@ -62,9 +62,10 @@ impl PaneRow {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-struct WorktreePrompt {
-    slug: String,
+#[derive(Debug, Clone)]
+enum InputMode {
+    WorktreeSlug { slug: String },
+    Command { tab: AppTab, command: String },
 }
 
 #[derive(Debug)]
@@ -78,7 +79,7 @@ pub struct App {
     mode: Mode,
     tui_pane_id: u64,
     attached_pane_id: Option<u64>,
-    project_prompt: Option<WorktreePrompt>,
+    input_mode: Option<InputMode>,
     status_message: String,
     last_error: Option<String>,
     should_quit: bool,
@@ -118,7 +119,7 @@ impl App {
             mode: Mode::Normal,
             tui_pane_id,
             attached_pane_id: None,
-            project_prompt: None,
+            input_mode: None,
             status_message: String::new(),
             last_error: None,
             should_quit: false,
@@ -149,8 +150,8 @@ impl App {
         self.selected_project_index
     }
 
-    pub fn is_project_prompt_active(&self) -> bool {
-        self.project_prompt.is_some()
+    pub fn is_input_active(&self) -> bool {
+        self.input_mode.is_some()
     }
 
     pub fn rows(&self) -> &[PaneRow] {
@@ -183,17 +184,33 @@ impl App {
     }
 
     pub fn input_line(&self) -> String {
-        match self.project_prompt.as_ref() {
-            Some(prompt) => {
+        match self.input_mode.as_ref() {
+            Some(InputMode::WorktreeSlug { slug }) => {
                 let root_name = self
                     .selected_project()
                     .map(|project| project.root_name.as_str())
                     .unwrap_or("-");
-                format!("Create worktree for {root_name}: {}", prompt.slug)
+                format!("Create worktree for {root_name}: {slug}")
+            }
+            Some(InputMode::Command { tab, command }) => {
+                let scope = match tab {
+                    AppTab::Projects => self
+                        .selected_project()
+                        .map(|project| project.name.as_str())
+                        .unwrap_or("-"),
+                    AppTab::Panes => "panes",
+                };
+                let tab = match tab {
+                    AppTab::Projects => "Projects",
+                    AppTab::Panes => "Panes",
+                };
+                format!("{tab} command for {scope}: :{command}")
             }
             None => match self.active_tab {
-                AppTab::Projects => "Ctrl-W create worktree from selected project".to_string(),
-                AppTab::Panes => "No active input".to_string(),
+                AppTab::Projects => {
+                    "Ctrl-W create worktree | : command on selected project".to_string()
+                }
+                AppTab::Panes => ": command on active tab".to_string(),
             },
         }
     }
@@ -230,21 +247,25 @@ impl App {
                 self.project_move_down();
                 Ok(())
             }
-            AppAction::StartCreateWorktreePrompt => {
-                self.start_worktree_prompt();
+            AppAction::StartCreateWorktreeInput => {
+                self.start_worktree_input();
                 Ok(())
             }
-            AppAction::ConfirmProjectPrompt => self.confirm_worktree_prompt(),
-            AppAction::CancelProjectPrompt => {
-                self.cancel_worktree_prompt();
+            AppAction::StartCommandInput => {
+                self.start_command_input();
                 Ok(())
             }
-            AppAction::EditProjectPrompt(c) => {
-                self.edit_worktree_prompt(c);
+            AppAction::ConfirmInput => self.confirm_input(),
+            AppAction::CancelInput => {
+                self.cancel_input();
                 Ok(())
             }
-            AppAction::DeleteProjectPromptChar => {
-                self.delete_worktree_prompt_char();
+            AppAction::EditInput(c) => {
+                self.edit_input(c);
+                Ok(())
+            }
+            AppAction::DeleteInputChar => {
+                self.delete_input_char();
                 Ok(())
             }
             AppAction::AttachSelected => self.attach_selected(wezterm),
@@ -331,50 +352,81 @@ impl App {
         }
     }
 
-    fn start_worktree_prompt(&mut self) {
+    fn start_worktree_input(&mut self) {
         let Some(project) = self.selected_project() else {
             self.record_error("No projects found");
             return;
         };
         let root_name = project.root_name.clone();
 
-        self.project_prompt = Some(WorktreePrompt::default());
+        self.input_mode = Some(InputMode::WorktreeSlug {
+            slug: String::new(),
+        });
         self.set_status(format!("Create worktree for {root_name}"));
     }
 
-    fn edit_worktree_prompt(&mut self, c: char) {
-        let Some(prompt) = self.project_prompt.as_mut() else {
+    fn start_command_input(&mut self) {
+        self.input_mode = Some(InputMode::Command {
+            tab: self.active_tab,
+            command: String::new(),
+        });
+        self.set_status("Command input");
+    }
+
+    fn edit_input(&mut self, c: char) {
+        let Some(input_mode) = self.input_mode.as_mut() else {
             return;
         };
 
-        prompt.slug.push(c);
+        match input_mode {
+            InputMode::WorktreeSlug { slug } => slug.push(c),
+            InputMode::Command { command, .. } => command.push(c),
+        }
         self.last_error = None;
     }
 
-    fn delete_worktree_prompt_char(&mut self) {
-        let Some(prompt) = self.project_prompt.as_mut() else {
+    fn delete_input_char(&mut self) {
+        let Some(input_mode) = self.input_mode.as_mut() else {
             return;
         };
 
-        prompt.slug.pop();
+        match input_mode {
+            InputMode::WorktreeSlug { slug } => {
+                slug.pop();
+            }
+            InputMode::Command { command, .. } => {
+                command.pop();
+            }
+        }
         self.last_error = None;
     }
 
-    fn cancel_worktree_prompt(&mut self) {
-        self.project_prompt = None;
-        self.set_status("Cancelled worktree creation");
+    fn cancel_input(&mut self) {
+        self.input_mode = None;
+        self.set_status("Cancelled input");
     }
 
-    fn confirm_worktree_prompt(&mut self) -> Result<()> {
-        let Some(prompt) = self.project_prompt.as_ref() else {
+    fn confirm_input(&mut self) -> Result<()> {
+        let Some(input_mode) = self.input_mode.clone() else {
             return Ok(());
         };
+
+        match input_mode {
+            InputMode::WorktreeSlug { slug } => self.confirm_worktree_input(&slug),
+            InputMode::Command { tab, command } => {
+                self.input_mode = None;
+                self.execute_command(tab, &command)
+            }
+        }
+    }
+
+    fn confirm_worktree_input(&mut self, slug: &str) -> Result<()> {
         let Some(project) = self.selected_project() else {
             self.record_error("No projects found");
             return Ok(());
         };
 
-        let slug = sanitize_worktree_slug(&prompt.slug);
+        let slug = sanitize_worktree_slug(slug);
         if slug.is_empty() {
             self.record_error("Worktree slug is empty");
             return Ok(());
@@ -386,9 +438,53 @@ impl App {
 
         run_git_worktree_add(&root_cwd, &slug, &target_cwd)?;
 
-        self.project_prompt = None;
+        self.input_mode = None;
         self.reload_projects(Some(&target_cwd))?;
         self.set_status(format!("Created worktree {} on {}", root_name, slug));
+        Ok(())
+    }
+
+    fn execute_command(&mut self, tab: AppTab, command: &str) -> Result<()> {
+        let command = command.trim();
+        if command.is_empty() {
+            self.set_status("Cancelled command");
+            return Ok(());
+        }
+
+        match tab {
+            AppTab::Projects => self.execute_project_command(command),
+            AppTab::Panes => bail!("no commands are implemented for the panes tab"),
+        }
+    }
+
+    fn execute_project_command(&mut self, command: &str) -> Result<()> {
+        match command {
+            "remove" => self.remove_selected_worktree(),
+            _ => bail!("unknown projects command: {command}"),
+        }
+    }
+
+    fn remove_selected_worktree(&mut self) -> Result<()> {
+        let project = self
+            .selected_project()
+            .cloned()
+            .ok_or_else(|| anyhow!("No projects found"))?;
+
+        if project.kind != ProjectKind::Worktree {
+            bail!("remove only works on linked worktrees");
+        }
+        if matches!(project.branch.as_str(), "DETACHED" | "N/A") {
+            bail!("remove requires a branch-backed worktree");
+        }
+
+        run_git_worktree_remove(&project.root_cwd, &project.cwd)?;
+        run_git_branch_delete(&project.root_cwd, &project.branch)?;
+
+        self.reload_projects(Some(&project.root_cwd))?;
+        self.set_status(format!(
+            "Removed worktree {} and branch {}",
+            project.name, project.branch
+        ));
         Ok(())
     }
 
@@ -715,15 +811,47 @@ fn run_git_worktree_add(root_cwd: &str, slug: &str, target_cwd: &str) -> Result<
     bail!("git worktree add failed: {}", stderr.trim())
 }
 
+fn run_git_worktree_remove(root_cwd: &str, target_cwd: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["-C", root_cwd, "worktree", "remove", target_cwd])
+        .output()
+        .with_context(|| format!("failed to remove worktree {target_cwd}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!("git worktree remove failed: {}", stderr.trim())
+}
+
+fn run_git_branch_delete(root_cwd: &str, branch: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["-C", root_cwd, "branch", "-d", branch])
+        .output()
+        .with_context(|| format!("failed to delete branch {branch} from {root_cwd}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!("git branch -d failed: {}", stderr.trim())
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use anyhow::Result;
 
     use super::{
         App, AppTab, GitProjectProbe, Mode, ProjectEntry, ProjectKind, build_project_entries,
-        sanitize_worktree_slug,
+        run_git_branch_delete, run_git_worktree_remove, sanitize_worktree_slug,
     };
     use crate::input::AppAction;
     use crate::wezterm::{NewTabCommand, PaneInfo, SplitDirection, WeztermClient};
@@ -1041,19 +1169,53 @@ mod tests {
     }
 
     #[test]
-    fn starting_worktree_prompt_sets_prompt_state() {
+    fn starting_input_modes_sets_input_state() {
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
         let mut app =
             App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
 
-        app.apply(AppAction::StartCreateWorktreePrompt, &mut wezterm)
-            .expect("prompt should start");
-        app.apply(AppAction::EditProjectPrompt('x'), &mut wezterm)
-            .expect("prompt should accept input");
+        app.apply(AppAction::StartCreateWorktreeInput, &mut wezterm)
+            .expect("worktree input should start");
+        app.apply(AppAction::EditInput('x'), &mut wezterm)
+            .expect("input should accept text");
 
-        assert!(app.is_project_prompt_active());
+        assert!(app.is_input_active());
         assert!(app.input_line().contains("Create worktree for alpha: x"));
+
+        app.apply(AppAction::CancelInput, &mut wezterm)
+            .expect("input should cancel");
+        app.apply(AppAction::StartCommandInput, &mut wezterm)
+            .expect("command input should start");
+        app.apply(AppAction::EditInput('r'), &mut wezterm)
+            .expect("input should accept text");
+
+        assert!(app.is_input_active());
+        assert!(app.input_line().contains("Projects command for alpha: :r"));
+    }
+
+    #[test]
+    fn remove_command_rejects_root_projects() {
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        app.apply(AppAction::StartCommandInput, &mut wezterm)
+            .expect("command input should start");
+        for c in "remove".chars() {
+            app.apply(AppAction::EditInput(c), &mut wezterm)
+                .expect("input should accept text");
+        }
+
+        let error = app
+            .apply(AppAction::ConfirmInput, &mut wezterm)
+            .expect_err("root remove should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("remove only works on linked worktrees")
+        );
     }
 
     #[test]
@@ -1204,5 +1366,91 @@ mod tests {
         assert_eq!(sanitize_worktree_slug(" Codex Hooks "), "codex-hooks");
         assert_eq!(sanitize_worktree_slug("review__2"), "review__2");
         assert_eq!(sanitize_worktree_slug("***"), "");
+    }
+
+    #[test]
+    fn removing_dirty_worktree_fails_before_branch_delete() {
+        let sandbox = test_sandbox("remove-dirty-worktree");
+        let root = sandbox.join("root");
+        let worktree = sandbox.join("root.review");
+
+        git(
+            &sandbox,
+            &["init", "--initial-branch=main", root_as_str(&root)],
+        );
+        write_file(&root.join("tracked.txt"), "hello\n");
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "add",
+                "tracked.txt",
+            ],
+        );
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "init",
+            ],
+        );
+        git(
+            &root,
+            &["worktree", "add", "-b", "review", root_as_str(&worktree)],
+        );
+        write_file(&worktree.join("dirty.txt"), "dirty\n");
+
+        let remove_error = run_git_worktree_remove(root_as_str(&root), root_as_str(&worktree))
+            .expect_err("dirty worktree removal should fail");
+        assert!(
+            remove_error
+                .to_string()
+                .contains("git worktree remove failed")
+        );
+
+        run_git_branch_delete(root_as_str(&root), "review")
+            .expect_err("branch should still be checked out in dirty worktree");
+    }
+
+    fn test_sandbox(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("nerve-center-{name}-{unique}"));
+        fs::create_dir_all(&dir).expect("sandbox should be created");
+        dir
+    }
+
+    fn git(workdir: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(workdir)
+            .output()
+            .expect("git command should start");
+        if output.status.success() {
+            return;
+        }
+
+        panic!(
+            "git command failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        fs::write(path, content).expect("file should be written");
+    }
+
+    fn root_as_str(path: &Path) -> &str {
+        path.to_str().expect("path should be valid utf-8")
     }
 }

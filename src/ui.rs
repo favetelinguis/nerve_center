@@ -39,7 +39,7 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    let title = if app.is_project_prompt_active() {
+    let title = if app.is_input_active() {
         "Input [ACTIVE]"
     } else {
         "Input"
