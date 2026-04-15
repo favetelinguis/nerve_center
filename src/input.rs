@@ -1,38 +1,70 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use crate::app::Mode;
+use crate::app::{AppTab, Mode};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppAction {
+    SwitchToProjects,
+    SwitchToPanes,
     MoveUp,
     MoveDown,
+    ProjectMoveUp,
+    ProjectMoveDown,
     AttachSelected,
+    OpenProjectShell,
+    OpenProjectEditor,
+    OpenProjectGit,
     Quit,
     ExitInsert,
     Forward(String),
 }
 
-pub fn action_for_key(mode: Mode, key: KeyEvent) -> Option<AppAction> {
+pub fn action_for_key(active_tab: AppTab, mode: Mode, key: KeyEvent) -> Option<AppAction> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return None;
     }
 
-    match mode {
-        Mode::Normal => normal_mode_action(key),
-        Mode::Insert => insert_mode_action(key),
+    match active_tab {
+        AppTab::Projects => project_mode_action(key),
+        AppTab::Panes => match mode {
+            Mode::Normal => pane_normal_mode_action(key),
+            Mode::Insert => insert_mode_action(key),
+        },
     }
 }
 
-fn normal_mode_action(key: KeyEvent) -> Option<AppAction> {
+fn pane_normal_mode_action(key: KeyEvent) -> Option<AppAction> {
     if key.modifiers != KeyModifiers::NONE {
         return None;
     }
 
     match key.code {
+        KeyCode::Char('1') => Some(AppAction::SwitchToProjects),
+        KeyCode::Char('2') => Some(AppAction::SwitchToPanes),
         KeyCode::Char('j') => Some(AppAction::MoveDown),
         KeyCode::Char('k') => Some(AppAction::MoveUp),
         KeyCode::Char('i') => Some(AppAction::AttachSelected),
         KeyCode::Char('q') => Some(AppAction::Quit),
+        _ => None,
+    }
+}
+
+fn project_mode_action(key: KeyEvent) -> Option<AppAction> {
+    match key.modifiers {
+        KeyModifiers::NONE => match key.code {
+            KeyCode::Char('1') => Some(AppAction::SwitchToProjects),
+            KeyCode::Char('2') => Some(AppAction::SwitchToPanes),
+            KeyCode::Char('j') => Some(AppAction::ProjectMoveDown),
+            KeyCode::Char('k') => Some(AppAction::ProjectMoveUp),
+            KeyCode::Char('q') => Some(AppAction::Quit),
+            _ => None,
+        },
+        KeyModifiers::CONTROL => match key.code {
+            KeyCode::Char('t') => Some(AppAction::OpenProjectShell),
+            KeyCode::Char('e') => Some(AppAction::OpenProjectEditor),
+            KeyCode::Char('v') => Some(AppAction::OpenProjectGit),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -55,19 +87,22 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use super::{AppAction, action_for_key};
-    use crate::app::Mode;
+    use crate::app::{AppTab, Mode};
 
     #[test]
-    fn normal_mode_maps_vim_keys() {
+    fn pane_normal_mode_maps_vim_keys() {
         let key = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
-        assert_eq!(action_for_key(Mode::Normal, key), Some(AppAction::MoveDown));
+        assert_eq!(
+            action_for_key(AppTab::Panes, Mode::Normal, key),
+            Some(AppAction::MoveDown)
+        );
     }
 
     #[test]
     fn insert_mode_maps_escape_locally() {
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(
-            action_for_key(Mode::Insert, key),
+            action_for_key(AppTab::Panes, Mode::Insert, key),
             Some(AppAction::ExitInsert)
         );
     }
@@ -76,7 +111,7 @@ mod tests {
     fn insert_mode_forwards_q_as_text() {
         let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
         assert_eq!(
-            action_for_key(Mode::Insert, key),
+            action_for_key(AppTab::Panes, Mode::Insert, key),
             Some(AppAction::Forward("q".to_string()))
         );
     }
@@ -84,6 +119,50 @@ mod tests {
     #[test]
     fn insert_mode_ignores_ctrl_chords() {
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(action_for_key(Mode::Insert, key), None);
+        assert_eq!(action_for_key(AppTab::Panes, Mode::Insert, key), None);
+    }
+
+    #[test]
+    fn project_mode_maps_navigation_and_actions() {
+        assert_eq!(
+            action_for_key(
+                AppTab::Projects,
+                Mode::Insert,
+                KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)
+            ),
+            Some(AppAction::ProjectMoveDown)
+        );
+        assert_eq!(
+            action_for_key(
+                AppTab::Projects,
+                Mode::Insert,
+                KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)
+            ),
+            Some(AppAction::SwitchToPanes)
+        );
+        assert_eq!(
+            action_for_key(
+                AppTab::Projects,
+                Mode::Normal,
+                KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)
+            ),
+            Some(AppAction::OpenProjectShell)
+        );
+        assert_eq!(
+            action_for_key(
+                AppTab::Projects,
+                Mode::Normal,
+                KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)
+            ),
+            Some(AppAction::OpenProjectEditor)
+        );
+        assert_eq!(
+            action_for_key(
+                AppTab::Projects,
+                Mode::Normal,
+                KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)
+            ),
+            Some(AppAction::OpenProjectGit)
+        );
     }
 }

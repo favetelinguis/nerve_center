@@ -1,9 +1,13 @@
-use anyhow::{Result, anyhow};
+use std::collections::BTreeSet;
+use std::env;
+use std::process::Command;
+
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::input::AppAction;
 use crate::wezterm::{
-    PaneInfo, SplitDirection, TuiTabLayout, WeztermClient, find_pane, listable_panes,
-    tui_pane_id_from_env, tui_tab_layout,
+    NewTabCommand, PaneInfo, SplitDirection, TuiTabLayout, WeztermClient, find_pane,
+    listable_panes, tui_pane_id_from_env, tui_tab_layout,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -11,6 +15,19 @@ pub enum Mode {
     #[default]
     Normal,
     Insert,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppTab {
+    #[default]
+    Projects,
+    Panes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectEntry {
+    pub name: String,
+    pub cwd: String,
 }
 
 #[derive(Debug, Clone)]
@@ -28,6 +45,9 @@ impl PaneRow {
 pub struct App {
     rows: Vec<PaneRow>,
     selected_index: usize,
+    projects: Vec<ProjectEntry>,
+    selected_project_index: usize,
+    active_tab: AppTab,
     mode: Mode,
     tui_pane_id: u64,
     attached_pane_id: Option<u64>,
@@ -38,12 +58,23 @@ pub struct App {
 
 impl App {
     pub fn load<W: WeztermClient>(wezterm: &mut W) -> Result<Self> {
+        let projects = discover_projects()?;
+        Self::load_with_projects(wezterm, projects)
+    }
+
+    fn load_with_projects<W: WeztermClient>(
+        wezterm: &mut W,
+        projects: Vec<ProjectEntry>,
+    ) -> Result<Self> {
         let tui_pane_id = tui_pane_id_from_env()?;
         let panes = wezterm.list_panes()?;
 
         let mut app = Self {
             rows: Vec::new(),
             selected_index: 0,
+            projects,
+            selected_project_index: 0,
+            active_tab: AppTab::Projects,
             mode: Mode::Normal,
             tui_pane_id,
             attached_pane_id: None,
@@ -52,12 +83,28 @@ impl App {
             should_quit: false,
         };
         app.replace_rows(panes)?;
-        app.set_status(format!("Loaded {} panes", app.rows.len()));
+        app.set_status(format!(
+            "Loaded {} projects and {} panes",
+            app.projects.len(),
+            app.rows.len()
+        ));
         Ok(app)
+    }
+
+    pub fn active_tab(&self) -> AppTab {
+        self.active_tab
     }
 
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    pub fn projects(&self) -> &[ProjectEntry] {
+        &self.projects
+    }
+
+    pub fn selected_project_index(&self) -> usize {
+        self.selected_project_index
     }
 
     pub fn rows(&self) -> &[PaneRow] {
@@ -93,8 +140,18 @@ impl App {
             .last_error
             .as_deref()
             .unwrap_or(self.status_message.as_str());
+        let tab = match self.active_tab {
+            AppTab::Projects => "projects",
+            AppTab::Panes => "panes",
+        };
+        let project = self
+            .selected_project()
+            .map(|item| item.name.as_str())
+            .unwrap_or("-");
 
-        format!("mode={mode} selected={selected} attached={attached} {message}")
+        format!(
+            "tab={tab} mode={mode} selected={selected} attached={attached} project={project} {message}"
+        )
     }
 
     pub fn record_error(&mut self, error: impl Into<String>) {
@@ -103,6 +160,16 @@ impl App {
 
     pub fn apply<W: WeztermClient>(&mut self, action: AppAction, wezterm: &mut W) -> Result<()> {
         match action {
+            AppAction::SwitchToProjects => {
+                self.active_tab = AppTab::Projects;
+                self.set_status("Projects tab");
+                Ok(())
+            }
+            AppAction::SwitchToPanes => {
+                self.active_tab = AppTab::Panes;
+                self.set_status("Panes tab");
+                Ok(())
+            }
             AppAction::MoveUp => {
                 self.move_up();
                 Ok(())
@@ -111,7 +178,18 @@ impl App {
                 self.move_down();
                 Ok(())
             }
+            AppAction::ProjectMoveUp => {
+                self.project_move_up();
+                Ok(())
+            }
+            AppAction::ProjectMoveDown => {
+                self.project_move_down();
+                Ok(())
+            }
             AppAction::AttachSelected => self.attach_selected(wezterm),
+            AppAction::OpenProjectShell => self.open_project_tab(wezterm, NewTabCommand::Shell),
+            AppAction::OpenProjectEditor => self.open_project_tab(wezterm, NewTabCommand::Nvim),
+            AppAction::OpenProjectGit => self.open_project_tab(wezterm, NewTabCommand::Lazygit),
             AppAction::Quit => {
                 self.should_quit = true;
                 self.set_status("Quit");
@@ -164,6 +242,10 @@ impl App {
         self.selected_row().map(|row| row.pane.pane_id)
     }
 
+    fn selected_project(&self) -> Option<&ProjectEntry> {
+        self.projects.get(self.selected_project_index)
+    }
+
     fn move_up(&mut self) {
         if !self.rows.is_empty() && self.selected_index > 0 {
             self.selected_index -= 1;
@@ -173,6 +255,18 @@ impl App {
     fn move_down(&mut self) {
         if !self.rows.is_empty() && self.selected_index + 1 < self.rows.len() {
             self.selected_index += 1;
+        }
+    }
+
+    fn project_move_up(&mut self) {
+        if !self.projects.is_empty() && self.selected_project_index > 0 {
+            self.selected_project_index -= 1;
+        }
+    }
+
+    fn project_move_down(&mut self) {
+        if !self.projects.is_empty() && self.selected_project_index + 1 < self.projects.len() {
+            self.selected_project_index += 1;
         }
     }
 
@@ -226,6 +320,29 @@ impl App {
         Ok(())
     }
 
+    fn open_project_tab<W: WeztermClient>(
+        &mut self,
+        wezterm: &mut W,
+        command: NewTabCommand,
+    ) -> Result<()> {
+        let project = match self.selected_project() {
+            Some(project) => project,
+            None => {
+                self.record_error("No projects found");
+                return Ok(());
+            }
+        };
+
+        wezterm.spawn_new_tab(self.tui_pane_id, &project.cwd, command)?;
+        wezterm.activate_pane(self.tui_pane_id)?;
+        self.set_status(format!(
+            "Opened {} tab for {}",
+            command.label(),
+            project.name
+        ));
+        Ok(())
+    }
+
     fn refresh<W: WeztermClient>(&mut self, wezterm: &mut W) -> Result<()> {
         let panes = wezterm.list_panes()?;
         self.replace_rows(panes)?;
@@ -239,15 +356,65 @@ impl App {
     }
 }
 
+fn discover_projects() -> Result<Vec<ProjectEntry>> {
+    let home = env::var("HOME").context("HOME is not set")?;
+    let repos_root = format!("{home}/repos");
+    let output = Command::new("fd")
+        .args(["-HI", "^.git$", "--max-depth", "4", "--prune", &repos_root])
+        .output()
+        .context("failed to spawn fd for project discovery")?;
+
+    if !output.status.success() {
+        bail!(
+            "fd project discovery failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let stdout = String::from_utf8(output.stdout)
+        .context("fd project discovery stdout was not valid UTF-8")?;
+    Ok(parse_projects(&stdout, &home))
+}
+
+fn parse_projects(stdout: &str, home: &str) -> Vec<ProjectEntry> {
+    let repos_prefix = format!("{home}/repos/");
+    let mut project_names = BTreeSet::new();
+
+    for line in stdout.lines() {
+        let project = line.trim().trim_end_matches("/.git");
+        if project.is_empty() {
+            continue;
+        }
+
+        let relative = project.strip_prefix(&repos_prefix).unwrap_or(project);
+        let Some(name) = relative.split('/').next() else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+
+        project_names.insert(name.to_string());
+    }
+
+    project_names
+        .into_iter()
+        .map(|name| ProjectEntry {
+            cwd: format!("{repos_prefix}{name}"),
+            name,
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
 
     use anyhow::Result;
 
-    use super::{App, Mode};
+    use super::{App, AppTab, Mode, ProjectEntry, parse_projects};
     use crate::input::AppAction;
-    use crate::wezterm::{PaneInfo, SplitDirection, WeztermClient};
+    use crate::wezterm::{NewTabCommand, PaneInfo, SplitDirection, WeztermClient};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Call {
@@ -262,6 +429,11 @@ mod tests {
         SendText {
             pane_id: u64,
             text: String,
+        },
+        SpawnNewTab {
+            pane_id: u64,
+            cwd: String,
+            command: NewTabCommand,
         },
     }
 
@@ -328,6 +500,28 @@ mod tests {
             });
             Ok(())
         }
+
+        fn spawn_new_tab(&mut self, pane_id: u64, cwd: &str, command: NewTabCommand) -> Result<()> {
+            self.calls.push(Call::SpawnNewTab {
+                pane_id,
+                cwd: cwd.to_string(),
+                command,
+            });
+            Ok(())
+        }
+    }
+
+    fn test_projects() -> Vec<ProjectEntry> {
+        vec![
+            ProjectEntry {
+                name: "alpha".to_string(),
+                cwd: "/tmp/repos/alpha".to_string(),
+            },
+            ProjectEntry {
+                name: "beta".to_string(),
+                cwd: "/tmp/repos/beta".to_string(),
+            },
+        ]
     }
 
     fn pane(pane_id: u64, tab_id: u64, window_id: u64) -> PaneInfo {
@@ -374,7 +568,8 @@ mod tests {
             vec![pane(10, 1, 1), pane(20, 1, 1)],
         ];
         let mut wezterm = FakeWezterm::new(snapshots);
-        let mut app = App::load(&mut wezterm).expect("app should load");
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
 
         app.apply(AppAction::AttachSelected, &mut wezterm)
             .expect("attach should succeed");
@@ -406,7 +601,8 @@ mod tests {
             vec![pane(10, 1, 1), pane(30, 1, 1), pane(20, 3, 1)],
         ];
         let mut wezterm = FakeWezterm::new(snapshots);
-        let mut app = App::load(&mut wezterm).expect("app should load");
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
         app.apply(AppAction::MoveDown, &mut wezterm)
             .expect("selection should move");
 
@@ -437,7 +633,8 @@ mod tests {
         set_wezterm_pane();
         let snapshots = vec![vec![pane(10, 1, 1), pane(20, 1, 1), pane(30, 2, 1)]];
         let mut wezterm = FakeWezterm::new(snapshots);
-        let mut app = App::load(&mut wezterm).expect("app should load");
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
 
         app.apply(AppAction::AttachSelected, &mut wezterm)
             .expect("attach should succeed");
@@ -457,7 +654,8 @@ mod tests {
             pane(40, 2, 1),
         ]];
         let mut wezterm = FakeWezterm::new(snapshots);
-        let mut app = App::load(&mut wezterm).expect("app should load");
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
 
         app.apply(AppAction::MoveDown, &mut wezterm)
             .expect("selection should move");
@@ -474,7 +672,8 @@ mod tests {
         set_wezterm_pane();
         let snapshots = vec![vec![pane(10, 1, 1), pane(20, 1, 1)]];
         let mut wezterm = FakeWezterm::new(snapshots);
-        let mut app = App::load(&mut wezterm).expect("app should load");
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
         app.apply(AppAction::AttachSelected, &mut wezterm)
             .expect("attach should succeed");
 
@@ -489,6 +688,139 @@ mod tests {
                 Call::SendText {
                     pane_id: 20,
                     text: "x".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn loads_on_projects_tab_by_default() {
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let app = App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        assert_eq!(app.active_tab(), AppTab::Projects);
+        assert_eq!(app.selected_project_index(), 0);
+        assert_eq!(app.projects().len(), 2);
+    }
+
+    #[test]
+    fn project_navigation_changes_selected_project() {
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        app.apply(AppAction::ProjectMoveDown, &mut wezterm)
+            .expect("move should succeed");
+        app.apply(AppAction::ProjectMoveUp, &mut wezterm)
+            .expect("move should succeed");
+
+        assert_eq!(app.selected_project_index(), 0);
+        assert_eq!(wezterm.calls, vec![Call::ListPanes]);
+    }
+
+    #[test]
+    fn switching_tabs_preserves_pane_mode() {
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 1, 1)]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        app.apply(AppAction::SwitchToPanes, &mut wezterm)
+            .expect("switch should succeed");
+        app.apply(AppAction::AttachSelected, &mut wezterm)
+            .expect("attach should succeed");
+        app.apply(AppAction::SwitchToProjects, &mut wezterm)
+            .expect("switch should succeed");
+        app.apply(AppAction::SwitchToPanes, &mut wezterm)
+            .expect("switch should succeed");
+
+        assert_eq!(app.active_tab(), AppTab::Panes);
+        assert_eq!(app.mode(), Mode::Insert);
+    }
+
+    #[test]
+    fn project_shell_open_spawns_and_refocuses_tui() {
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        app.apply(AppAction::OpenProjectShell, &mut wezterm)
+            .expect("open should succeed");
+
+        assert_eq!(
+            wezterm.calls,
+            vec![
+                Call::ListPanes,
+                Call::SpawnNewTab {
+                    pane_id: 10,
+                    cwd: "/tmp/repos/alpha".to_string(),
+                    command: NewTabCommand::Shell,
+                },
+                Call::ActivatePane(10),
+            ]
+        );
+    }
+
+    #[test]
+    fn project_actions_use_selected_project_cwd() {
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+        app.apply(AppAction::ProjectMoveDown, &mut wezterm)
+            .expect("move should succeed");
+
+        app.apply(AppAction::OpenProjectEditor, &mut wezterm)
+            .expect("open should succeed");
+        app.apply(AppAction::OpenProjectGit, &mut wezterm)
+            .expect("open should succeed");
+
+        assert_eq!(
+            wezterm.calls,
+            vec![
+                Call::ListPanes,
+                Call::SpawnNewTab {
+                    pane_id: 10,
+                    cwd: "/tmp/repos/beta".to_string(),
+                    command: NewTabCommand::Nvim,
+                },
+                Call::ActivatePane(10),
+                Call::SpawnNewTab {
+                    pane_id: 10,
+                    cwd: "/tmp/repos/beta".to_string(),
+                    command: NewTabCommand::Lazygit,
+                },
+                Call::ActivatePane(10),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_top_level_project_names_from_fd_output() {
+        let output = concat!(
+            "/home/test/repos/zeph/.git\n",
+            "/home/test/repos/codex/codex-cli/.git\n",
+            "/home/test/repos/codex/codex-rs/.git\n",
+            "/home/test/repos/hello/.git\n"
+        );
+
+        assert_eq!(
+            parse_projects(output, "/home/test"),
+            vec![
+                ProjectEntry {
+                    name: "codex".to_string(),
+                    cwd: "/home/test/repos/codex".to_string(),
+                },
+                ProjectEntry {
+                    name: "hello".to_string(),
+                    cwd: "/home/test/repos/hello".to_string(),
+                },
+                ProjectEntry {
+                    name: "zeph".to_string(),
+                    cwd: "/home/test/repos/zeph".to_string(),
                 },
             ]
         );

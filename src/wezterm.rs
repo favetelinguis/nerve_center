@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsStr;
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -40,6 +41,31 @@ pub enum SplitDirection {
     Right,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewTabCommand {
+    Shell,
+    Nvim,
+    Lazygit,
+}
+
+impl NewTabCommand {
+    fn args(self) -> &'static [&'static str] {
+        match self {
+            Self::Shell => &["zsh", "-il"],
+            Self::Nvim => &["nvim"],
+            Self::Lazygit => &["lazygit"],
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Shell => "shell",
+            Self::Nvim => "nvim",
+            Self::Lazygit => "lazygit",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiTabLayout {
     Solo,
@@ -58,6 +84,7 @@ pub trait WeztermClient {
     ) -> Result<()>;
     fn activate_pane(&mut self, pane_id: u64) -> Result<()>;
     fn send_text(&mut self, pane_id: u64, text: &str) -> Result<()>;
+    fn spawn_new_tab(&mut self, pane_id: u64, cwd: &str, command: NewTabCommand) -> Result<()>;
 }
 
 #[derive(Debug, Default)]
@@ -112,6 +139,20 @@ impl WeztermClient for ProcessWezterm {
         ])?;
         Ok(())
     }
+
+    fn spawn_new_tab(&mut self, pane_id: u64, cwd: &str, command: NewTabCommand) -> Result<()> {
+        let mut args = vec![
+            "spawn".to_string(),
+            "--pane-id".to_string(),
+            pane_id.to_string(),
+            "--cwd".to_string(),
+            cwd.to_string(),
+            "--".to_string(),
+        ];
+        args.extend(command.args().iter().map(|arg| (*arg).to_string()));
+        run_wezterm_cli(args)?;
+        Ok(())
+    }
 }
 
 pub fn tui_pane_id_from_env() -> Result<u64> {
@@ -163,9 +204,10 @@ pub fn tui_tab_layout(panes: &[PaneInfo], tui_pane_id: u64) -> Result<TuiTabLayo
     }
 }
 
-fn run_wezterm_cli<'a, I>(args: I) -> Result<String>
+fn run_wezterm_cli<I, S>(args: I) -> Result<String>
 where
-    I: IntoIterator<Item = &'a str>,
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
 {
     let output = Command::new("wezterm")
         .arg("cli")

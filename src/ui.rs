@@ -1,17 +1,63 @@
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs};
 use ratatui::{Frame, symbols};
 
-use crate::app::{App, Mode};
+use crate::app::{App, AppTab, Mode};
 
 pub fn render(frame: &mut Frame, app: &App) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(3),
+        ])
         .split(frame.area());
 
+    let tabs = Tabs::new(vec!["1 Projects", "2 Panes"])
+        .block(Block::default().borders(Borders::ALL).title("Views"))
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+        .select(match app.active_tab() {
+            AppTab::Projects => 0,
+            AppTab::Panes => 1,
+        });
+    frame.render_widget(tabs, layout[0]);
+
+    match app.active_tab() {
+        AppTab::Projects => render_projects(frame, app, layout[1]),
+        AppTab::Panes => render_panes(frame, app, layout[1]),
+    }
+
+    let footer =
+        Paragraph::new(Line::from(app.status_line())).block(Block::default().borders(Borders::ALL));
+    frame.render_widget(footer, layout[2]);
+}
+
+fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let rows = if app.projects().is_empty() {
+        vec![ListItem::new("No projects found")]
+    } else {
+        app.projects()
+            .iter()
+            .map(|project| ListItem::new(project.name.clone()))
+            .collect::<Vec<_>>()
+    };
+
+    let list = List::new(rows)
+        .block(Block::default().borders(Borders::ALL).title("Projects"))
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+        .highlight_symbol(symbols::DOT);
+
+    let mut list_state = ratatui::widgets::ListState::default();
+    if !app.projects().is_empty() {
+        list_state.select(Some(app.selected_project_index()));
+    }
+    frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+fn render_panes(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let rows = if app.rows().is_empty() {
         vec![ListItem::new("No selectable panes")]
     } else {
@@ -55,9 +101,5 @@ pub fn render(frame: &mut Frame, app: &App) {
     if !app.rows().is_empty() {
         list_state.select(Some(app.selected_index()));
     }
-    frame.render_stateful_widget(list, layout[0], &mut list_state);
-
-    let footer =
-        Paragraph::new(Line::from(app.status_line())).block(Block::default().borders(Borders::ALL));
-    frame.render_widget(footer, layout[1]);
+    frame.render_stateful_widget(list, area, &mut list_state);
 }
