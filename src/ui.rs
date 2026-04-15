@@ -13,6 +13,7 @@ pub fn render(frame: &mut Frame, app: &App) {
             Constraint::Length(3),
             Constraint::Min(1),
             Constraint::Length(3),
+            Constraint::Length(3),
         ])
         .split(frame.area());
 
@@ -30,18 +31,45 @@ pub fn render(frame: &mut Frame, app: &App) {
         AppTab::Panes => render_panes(frame, app, layout[1]),
     }
 
+    render_input(frame, app, layout[2]);
+
     let footer =
         Paragraph::new(Line::from(app.status_line())).block(Block::default().borders(Borders::ALL));
-    frame.render_widget(footer, layout[2]);
+    frame.render_widget(footer, layout[3]);
+}
+
+fn render_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let title = if app.is_project_prompt_active() {
+        "Input [ACTIVE]"
+    } else {
+        "Input"
+    };
+    let input = Paragraph::new(Line::from(app.input_line()))
+        .block(Block::default().borders(Borders::ALL).title(title));
+    frame.render_widget(input, area);
 }
 
 fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let rows = if app.projects().is_empty() {
         vec![ListItem::new("No projects found")]
     } else {
+        let labels = app
+            .projects()
+            .iter()
+            .map(|project| project.tree_label())
+            .collect::<Vec<_>>();
+        let label_width = labels.iter().map(|label| label.len()).max().unwrap_or(0);
+
         app.projects()
             .iter()
-            .map(|project| ListItem::new(project.name.clone()))
+            .zip(labels)
+            .map(|(project, label)| {
+                ListItem::new(format!(
+                    "{label:<label_width$}  {}",
+                    project.branch,
+                    label_width = label_width
+                ))
+            })
             .collect::<Vec<_>>()
     };
 

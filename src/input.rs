@@ -10,6 +10,11 @@ pub enum AppAction {
     MoveDown,
     ProjectMoveUp,
     ProjectMoveDown,
+    StartCreateWorktreePrompt,
+    ConfirmProjectPrompt,
+    CancelProjectPrompt,
+    EditProjectPrompt(char),
+    DeleteProjectPromptChar,
     AttachSelected,
     OpenProjectShell,
     OpenProjectEditor,
@@ -19,13 +24,24 @@ pub enum AppAction {
     Forward(String),
 }
 
-pub fn action_for_key(active_tab: AppTab, mode: Mode, key: KeyEvent) -> Option<AppAction> {
+pub fn action_for_key(
+    active_tab: AppTab,
+    mode: Mode,
+    project_prompt_active: bool,
+    key: KeyEvent,
+) -> Option<AppAction> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return None;
     }
 
     match active_tab {
-        AppTab::Projects => project_mode_action(key),
+        AppTab::Projects => {
+            if project_prompt_active {
+                project_prompt_action(key)
+            } else {
+                project_mode_action(key)
+            }
+        }
         AppTab::Panes => match mode {
             Mode::Normal => pane_normal_mode_action(key),
             Mode::Insert => insert_mode_action(key),
@@ -63,8 +79,21 @@ fn project_mode_action(key: KeyEvent) -> Option<AppAction> {
             KeyCode::Char('t') => Some(AppAction::OpenProjectShell),
             KeyCode::Char('e') => Some(AppAction::OpenProjectEditor),
             KeyCode::Char('v') => Some(AppAction::OpenProjectGit),
+            KeyCode::Char('w') => Some(AppAction::StartCreateWorktreePrompt),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+fn project_prompt_action(key: KeyEvent) -> Option<AppAction> {
+    match key.code {
+        KeyCode::Esc => Some(AppAction::CancelProjectPrompt),
+        KeyCode::Enter => Some(AppAction::ConfirmProjectPrompt),
+        KeyCode::Backspace => Some(AppAction::DeleteProjectPromptChar),
+        KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+            Some(AppAction::EditProjectPrompt(c))
+        }
         _ => None,
     }
 }
@@ -93,7 +122,7 @@ mod tests {
     fn pane_normal_mode_maps_vim_keys() {
         let key = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE);
         assert_eq!(
-            action_for_key(AppTab::Panes, Mode::Normal, key),
+            action_for_key(AppTab::Panes, Mode::Normal, false, key),
             Some(AppAction::MoveDown)
         );
     }
@@ -102,7 +131,7 @@ mod tests {
     fn insert_mode_maps_escape_locally() {
         let key = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
         assert_eq!(
-            action_for_key(AppTab::Panes, Mode::Insert, key),
+            action_for_key(AppTab::Panes, Mode::Insert, false, key),
             Some(AppAction::ExitInsert)
         );
     }
@@ -111,7 +140,7 @@ mod tests {
     fn insert_mode_forwards_q_as_text() {
         let key = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
         assert_eq!(
-            action_for_key(AppTab::Panes, Mode::Insert, key),
+            action_for_key(AppTab::Panes, Mode::Insert, false, key),
             Some(AppAction::Forward("q".to_string()))
         );
     }
@@ -119,7 +148,10 @@ mod tests {
     #[test]
     fn insert_mode_ignores_ctrl_chords() {
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
-        assert_eq!(action_for_key(AppTab::Panes, Mode::Insert, key), None);
+        assert_eq!(
+            action_for_key(AppTab::Panes, Mode::Insert, false, key),
+            None
+        );
     }
 
     #[test]
@@ -128,6 +160,7 @@ mod tests {
             action_for_key(
                 AppTab::Projects,
                 Mode::Insert,
+                false,
                 KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)
             ),
             Some(AppAction::ProjectMoveDown)
@@ -136,6 +169,7 @@ mod tests {
             action_for_key(
                 AppTab::Projects,
                 Mode::Insert,
+                false,
                 KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)
             ),
             Some(AppAction::SwitchToPanes)
@@ -144,6 +178,7 @@ mod tests {
             action_for_key(
                 AppTab::Projects,
                 Mode::Normal,
+                false,
                 KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)
             ),
             Some(AppAction::OpenProjectShell)
@@ -152,6 +187,7 @@ mod tests {
             action_for_key(
                 AppTab::Projects,
                 Mode::Normal,
+                false,
                 KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)
             ),
             Some(AppAction::OpenProjectEditor)
@@ -160,9 +196,50 @@ mod tests {
             action_for_key(
                 AppTab::Projects,
                 Mode::Normal,
+                false,
                 KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL)
             ),
             Some(AppAction::OpenProjectGit)
+        );
+        assert_eq!(
+            action_for_key(
+                AppTab::Projects,
+                Mode::Normal,
+                false,
+                KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)
+            ),
+            Some(AppAction::StartCreateWorktreePrompt)
+        );
+    }
+
+    #[test]
+    fn project_prompt_maps_editing_keys() {
+        assert_eq!(
+            action_for_key(
+                AppTab::Projects,
+                Mode::Normal,
+                true,
+                KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+            ),
+            Some(AppAction::EditProjectPrompt('x'))
+        );
+        assert_eq!(
+            action_for_key(
+                AppTab::Projects,
+                Mode::Normal,
+                true,
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
+            ),
+            Some(AppAction::DeleteProjectPromptChar)
+        );
+        assert_eq!(
+            action_for_key(
+                AppTab::Projects,
+                Mode::Normal,
+                true,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+            ),
+            Some(AppAction::ConfirmProjectPrompt)
         );
     }
 }

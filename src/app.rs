@@ -1,5 +1,7 @@
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -25,9 +27,28 @@ pub enum AppTab {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectKind {
+    Root,
+    Worktree,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectEntry {
     pub name: String,
     pub cwd: String,
+    pub branch: String,
+    pub root_name: String,
+    pub root_cwd: String,
+    pub kind: ProjectKind,
+}
+
+impl ProjectEntry {
+    pub fn tree_label(&self) -> String {
+        match self.kind {
+            ProjectKind::Root => self.name.clone(),
+            ProjectKind::Worktree => format!("  |- {}", self.name),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -41,16 +62,23 @@ impl PaneRow {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct WorktreePrompt {
+    slug: String,
+}
+
 #[derive(Debug)]
 pub struct App {
     rows: Vec<PaneRow>,
     selected_index: usize,
     projects: Vec<ProjectEntry>,
     selected_project_index: usize,
+    repos_root: String,
     active_tab: AppTab,
     mode: Mode,
     tui_pane_id: u64,
     attached_pane_id: Option<u64>,
+    project_prompt: Option<WorktreePrompt>,
     status_message: String,
     last_error: Option<String>,
     should_quit: bool,
@@ -58,12 +86,23 @@ pub struct App {
 
 impl App {
     pub fn load<W: WeztermClient>(wezterm: &mut W) -> Result<Self> {
-        let projects = discover_projects()?;
-        Self::load_with_projects(wezterm, projects)
+        let repos_root = repos_root_from_env()?;
+        let projects = discover_projects_in(&repos_root)?;
+        Self::load_with_projects_in(wezterm, repos_root, projects)
     }
 
+    #[cfg(test)]
     fn load_with_projects<W: WeztermClient>(
         wezterm: &mut W,
+        projects: Vec<ProjectEntry>,
+    ) -> Result<Self> {
+        let repos_root = infer_repos_root(&projects).unwrap_or_else(|| "/tmp/repos".to_string());
+        Self::load_with_projects_in(wezterm, repos_root, projects)
+    }
+
+    fn load_with_projects_in<W: WeztermClient>(
+        wezterm: &mut W,
+        repos_root: String,
         projects: Vec<ProjectEntry>,
     ) -> Result<Self> {
         let tui_pane_id = tui_pane_id_from_env()?;
@@ -72,16 +111,19 @@ impl App {
         let mut app = Self {
             rows: Vec::new(),
             selected_index: 0,
-            projects,
+            projects: Vec::new(),
             selected_project_index: 0,
+            repos_root,
             active_tab: AppTab::Projects,
             mode: Mode::Normal,
             tui_pane_id,
             attached_pane_id: None,
+            project_prompt: None,
             status_message: String::new(),
             last_error: None,
             should_quit: false,
         };
+        app.replace_projects(projects, None);
         app.replace_rows(panes)?;
         app.set_status(format!(
             "Loaded {} projects and {} panes",
@@ -107,6 +149,10 @@ impl App {
         self.selected_project_index
     }
 
+    pub fn is_project_prompt_active(&self) -> bool {
+        self.project_prompt.is_some()
+    }
+
     pub fn rows(&self) -> &[PaneRow] {
         &self.rows
     }
@@ -124,34 +170,32 @@ impl App {
     }
 
     pub fn status_line(&self) -> String {
-        let mode = match self.mode {
-            Mode::Normal => "NORMAL",
-            Mode::Insert => "INSERT",
-        };
-        let selected = self
-            .selected_row()
-            .map(|row| row.pane.pane_id.to_string())
-            .unwrap_or_else(|| "-".to_string());
-        let attached = self
-            .attached_pane_id
-            .map(|pane_id| pane_id.to_string())
-            .unwrap_or_else(|| "-".to_string());
         let message = self
             .last_error
             .as_deref()
             .unwrap_or(self.status_message.as_str());
-        let tab = match self.active_tab {
-            AppTab::Projects => "projects",
-            AppTab::Panes => "panes",
+        let prefix = if self.last_error.is_some() {
+            "ERROR"
+        } else {
+            "STATUS"
         };
-        let project = self
-            .selected_project()
-            .map(|item| item.name.as_str())
-            .unwrap_or("-");
+        format!("{prefix}: {message}")
+    }
 
-        format!(
-            "tab={tab} mode={mode} selected={selected} attached={attached} project={project} {message}"
-        )
+    pub fn input_line(&self) -> String {
+        match self.project_prompt.as_ref() {
+            Some(prompt) => {
+                let root_name = self
+                    .selected_project()
+                    .map(|project| project.root_name.as_str())
+                    .unwrap_or("-");
+                format!("Create worktree for {root_name}: {}", prompt.slug)
+            }
+            None => match self.active_tab {
+                AppTab::Projects => "Ctrl-W create worktree from selected project".to_string(),
+                AppTab::Panes => "No active input".to_string(),
+            },
+        }
     }
 
     pub fn record_error(&mut self, error: impl Into<String>) {
@@ -184,6 +228,23 @@ impl App {
             }
             AppAction::ProjectMoveDown => {
                 self.project_move_down();
+                Ok(())
+            }
+            AppAction::StartCreateWorktreePrompt => {
+                self.start_worktree_prompt();
+                Ok(())
+            }
+            AppAction::ConfirmProjectPrompt => self.confirm_worktree_prompt(),
+            AppAction::CancelProjectPrompt => {
+                self.cancel_worktree_prompt();
+                Ok(())
+            }
+            AppAction::EditProjectPrompt(c) => {
+                self.edit_worktree_prompt(c);
+                Ok(())
+            }
+            AppAction::DeleteProjectPromptChar => {
+                self.delete_worktree_prompt_char();
                 Ok(())
             }
             AppAction::AttachSelected => self.attach_selected(wezterm),
@@ -270,6 +331,67 @@ impl App {
         }
     }
 
+    fn start_worktree_prompt(&mut self) {
+        let Some(project) = self.selected_project() else {
+            self.record_error("No projects found");
+            return;
+        };
+        let root_name = project.root_name.clone();
+
+        self.project_prompt = Some(WorktreePrompt::default());
+        self.set_status(format!("Create worktree for {root_name}"));
+    }
+
+    fn edit_worktree_prompt(&mut self, c: char) {
+        let Some(prompt) = self.project_prompt.as_mut() else {
+            return;
+        };
+
+        prompt.slug.push(c);
+        self.last_error = None;
+    }
+
+    fn delete_worktree_prompt_char(&mut self) {
+        let Some(prompt) = self.project_prompt.as_mut() else {
+            return;
+        };
+
+        prompt.slug.pop();
+        self.last_error = None;
+    }
+
+    fn cancel_worktree_prompt(&mut self) {
+        self.project_prompt = None;
+        self.set_status("Cancelled worktree creation");
+    }
+
+    fn confirm_worktree_prompt(&mut self) -> Result<()> {
+        let Some(prompt) = self.project_prompt.as_ref() else {
+            return Ok(());
+        };
+        let Some(project) = self.selected_project() else {
+            self.record_error("No projects found");
+            return Ok(());
+        };
+
+        let slug = sanitize_worktree_slug(&prompt.slug);
+        if slug.is_empty() {
+            self.record_error("Worktree slug is empty");
+            return Ok(());
+        }
+
+        let root_cwd = project.root_cwd.clone();
+        let root_name = project.root_name.clone();
+        let target_cwd = format!("{}/{}.{}", self.repos_root, root_name, slug);
+
+        run_git_worktree_add(&root_cwd, &slug, &target_cwd)?;
+
+        self.project_prompt = None;
+        self.reload_projects(Some(&target_cwd))?;
+        self.set_status(format!("Created worktree {} on {}", root_name, slug));
+        Ok(())
+    }
+
     fn attach_selected<W: WeztermClient>(&mut self, wezterm: &mut W) -> Result<()> {
         let selected_pane_id = match self.selected_pane_id() {
             Some(pane_id) => pane_id,
@@ -350,60 +472,247 @@ impl App {
         Ok(())
     }
 
+    fn reload_projects(&mut self, selected_cwd: Option<&str>) -> Result<()> {
+        let projects = discover_projects_in(&self.repos_root)?;
+        self.replace_projects(projects, selected_cwd);
+        Ok(())
+    }
+
+    fn replace_projects(&mut self, projects: Vec<ProjectEntry>, selected_cwd: Option<&str>) {
+        let previous_selection = selected_cwd
+            .map(str::to_string)
+            .or_else(|| self.selected_project().map(|project| project.cwd.clone()));
+        self.projects = projects;
+        self.selected_project_index = previous_selection
+            .as_deref()
+            .and_then(|cwd| self.projects.iter().position(|project| project.cwd == cwd))
+            .unwrap_or(0);
+
+        if self.selected_project_index >= self.projects.len() {
+            self.selected_project_index = self.projects.len().saturating_sub(1);
+        }
+    }
+
     fn set_status(&mut self, status: impl Into<String>) {
         self.status_message = status.into();
         self.last_error = None;
     }
 }
 
-fn discover_projects() -> Result<Vec<ProjectEntry>> {
+fn repos_root_from_env() -> Result<String> {
     let home = env::var("HOME").context("HOME is not set")?;
-    let repos_root = format!("{home}/repos");
-    let output = Command::new("fd")
-        .args(["-HI", "^.git$", "--max-depth", "4", "--prune", &repos_root])
-        .output()
-        .context("failed to spawn fd for project discovery")?;
-
-    if !output.status.success() {
-        bail!(
-            "fd project discovery failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-
-    let stdout = String::from_utf8(output.stdout)
-        .context("fd project discovery stdout was not valid UTF-8")?;
-    Ok(parse_projects(&stdout, &home))
+    Ok(format!("{home}/repos"))
 }
 
-fn parse_projects(stdout: &str, home: &str) -> Vec<ProjectEntry> {
-    let repos_prefix = format!("{home}/repos/");
-    let mut project_names = BTreeSet::new();
+#[cfg(test)]
+fn infer_repos_root(projects: &[ProjectEntry]) -> Option<String> {
+    projects.first().and_then(|project| {
+        Path::new(&project.root_cwd)
+            .parent()
+            .map(|path| path.to_string_lossy().into_owned())
+    })
+}
 
-    for line in stdout.lines() {
-        let project = line.trim().trim_end_matches("/.git");
-        if project.is_empty() {
+fn discover_projects_in(repos_root: &str) -> Result<Vec<ProjectEntry>> {
+    let mut probes = Vec::new();
+
+    for entry in fs::read_dir(repos_root)
+        .with_context(|| format!("failed to read repos root {repos_root}"))?
+    {
+        let entry = entry.with_context(|| format!("failed to read entry in {repos_root}"))?;
+        let path = entry.path();
+        if !path.is_dir() {
             continue;
         }
 
-        let relative = project.strip_prefix(&repos_prefix).unwrap_or(project);
-        let Some(name) = relative.split('/').next() else {
-            continue;
-        };
-        if name.is_empty() {
-            continue;
+        if let Some(probe) = inspect_git_project(&path)? {
+            probes.push(probe);
         }
-
-        project_names.insert(name.to_string());
     }
 
-    project_names
-        .into_iter()
-        .map(|name| ProjectEntry {
-            cwd: format!("{repos_prefix}{name}"),
-            name,
-        })
-        .collect()
+    Ok(build_project_entries(probes))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitProjectProbe {
+    name: String,
+    cwd: String,
+    branch: String,
+    root_name: String,
+    root_cwd: String,
+    common_dir: String,
+    is_root: bool,
+}
+
+fn inspect_git_project(path: &Path) -> Result<Option<GitProjectProbe>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args([
+            "rev-parse",
+            "--show-toplevel",
+            "--git-dir",
+            "--git-common-dir",
+        ])
+        .output()
+        .with_context(|| format!("failed to inspect git metadata for {}", path.display()))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let stdout =
+        String::from_utf8(output.stdout).context("git rev-parse stdout was not valid UTF-8")?;
+    let mut lines = stdout.lines();
+    let cwd = lines
+        .next()
+        .context("git rev-parse missing --show-toplevel output")?
+        .trim()
+        .to_string();
+    let git_dir = lines
+        .next()
+        .context("git rev-parse missing --git-dir output")?
+        .trim()
+        .to_string();
+    let common_dir = lines
+        .next()
+        .context("git rev-parse missing --git-common-dir output")?
+        .trim()
+        .to_string();
+
+    let cwd_path = PathBuf::from(&cwd);
+    let git_dir = resolve_git_path(&cwd_path, &git_dir);
+    let common_dir = resolve_git_path(&cwd_path, &common_dir);
+    let root_cwd = common_dir
+        .parent()
+        .context("git common dir did not have a parent directory")?
+        .to_path_buf();
+    let root_name = root_cwd
+        .file_name()
+        .context("git root did not have a final path component")?
+        .to_string_lossy()
+        .into_owned();
+    let name = cwd_path
+        .file_name()
+        .context("project path did not have a final path component")?
+        .to_string_lossy()
+        .into_owned();
+
+    Ok(Some(GitProjectProbe {
+        name,
+        cwd,
+        branch: read_branch_name(path)?,
+        root_name,
+        root_cwd: root_cwd.to_string_lossy().into_owned(),
+        common_dir: common_dir.to_string_lossy().into_owned(),
+        is_root: git_dir == common_dir,
+    }))
+}
+
+fn resolve_git_path(base: &Path, git_path: &str) -> PathBuf {
+    let path = Path::new(git_path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
+fn read_branch_name(path: &Path) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["branch", "--show-current"])
+        .output()
+        .with_context(|| format!("failed to read branch for {}", path.display()))?;
+
+    if !output.status.success() {
+        return Ok("N/A".to_string());
+    }
+
+    let branch = String::from_utf8(output.stdout)
+        .context("git branch stdout was not valid UTF-8")?
+        .trim()
+        .to_string();
+    if branch.is_empty() {
+        Ok("DETACHED".to_string())
+    } else {
+        Ok(branch)
+    }
+}
+
+fn build_project_entries(probes: Vec<GitProjectProbe>) -> Vec<ProjectEntry> {
+    let mut groups = BTreeMap::<String, Vec<GitProjectProbe>>::new();
+    for probe in probes {
+        groups
+            .entry(probe.common_dir.clone())
+            .or_default()
+            .push(probe);
+    }
+
+    let mut groups = groups.into_values().collect::<Vec<_>>();
+    groups.sort_by(|left, right| left[0].root_name.cmp(&right[0].root_name));
+
+    let mut projects = Vec::new();
+    for mut group in groups {
+        group.sort_by(|left, right| match (left.is_root, right.is_root) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => left.name.cmp(&right.name),
+        });
+
+        for probe in group {
+            projects.push(ProjectEntry {
+                name: probe.name,
+                cwd: probe.cwd,
+                branch: probe.branch,
+                root_name: probe.root_name,
+                root_cwd: probe.root_cwd,
+                kind: if probe.is_root {
+                    ProjectKind::Root
+                } else {
+                    ProjectKind::Worktree
+                },
+            });
+        }
+    }
+
+    projects
+}
+
+fn sanitize_worktree_slug(input: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_dash = false;
+
+    for c in input.trim().chars() {
+        let c = c.to_ascii_lowercase();
+        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            slug.push(c);
+            previous_dash = false;
+            continue;
+        }
+
+        if !previous_dash {
+            slug.push('-');
+            previous_dash = true;
+        }
+    }
+
+    slug.trim_matches('-').to_string()
+}
+
+fn run_git_worktree_add(root_cwd: &str, slug: &str, target_cwd: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["-C", root_cwd, "worktree", "add", "-b", slug, target_cwd])
+        .output()
+        .with_context(|| format!("failed to create worktree from {root_cwd}"))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!("git worktree add failed: {}", stderr.trim())
 }
 
 #[cfg(test)]
@@ -412,7 +721,10 @@ mod tests {
 
     use anyhow::Result;
 
-    use super::{App, AppTab, Mode, ProjectEntry, parse_projects};
+    use super::{
+        App, AppTab, GitProjectProbe, Mode, ProjectEntry, ProjectKind, build_project_entries,
+        sanitize_worktree_slug,
+    };
     use crate::input::AppAction;
     use crate::wezterm::{NewTabCommand, PaneInfo, SplitDirection, WeztermClient};
 
@@ -516,10 +828,18 @@ mod tests {
             ProjectEntry {
                 name: "alpha".to_string(),
                 cwd: "/tmp/repos/alpha".to_string(),
+                branch: "main".to_string(),
+                root_name: "alpha".to_string(),
+                root_cwd: "/tmp/repos/alpha".to_string(),
+                kind: ProjectKind::Root,
             },
             ProjectEntry {
                 name: "beta".to_string(),
                 cwd: "/tmp/repos/beta".to_string(),
+                branch: "feature".to_string(),
+                root_name: "beta".to_string(),
+                root_cwd: "/tmp/repos/beta".to_string(),
+                kind: ProjectKind::Root,
             },
         ]
     }
@@ -721,6 +1041,22 @@ mod tests {
     }
 
     #[test]
+    fn starting_worktree_prompt_sets_prompt_state() {
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        app.apply(AppAction::StartCreateWorktreePrompt, &mut wezterm)
+            .expect("prompt should start");
+        app.apply(AppAction::EditProjectPrompt('x'), &mut wezterm)
+            .expect("prompt should accept input");
+
+        assert!(app.is_project_prompt_active());
+        assert!(app.input_line().contains("Create worktree for alpha: x"));
+    }
+
+    #[test]
     fn switching_tabs_preserves_pane_mode() {
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 1, 1)]]);
@@ -799,30 +1135,74 @@ mod tests {
     }
 
     #[test]
-    fn parses_top_level_project_names_from_fd_output() {
-        let output = concat!(
-            "/home/test/repos/zeph/.git\n",
-            "/home/test/repos/codex/codex-cli/.git\n",
-            "/home/test/repos/codex/codex-rs/.git\n",
-            "/home/test/repos/hello/.git\n"
-        );
+    fn builds_project_tree_with_root_first_and_worktrees_nested() {
+        let projects = build_project_entries(vec![
+            GitProjectProbe {
+                name: "nerve_center.codex-hooks".to_string(),
+                cwd: "/home/test/repos/nerve_center.codex-hooks".to_string(),
+                branch: "codex-hooks".to_string(),
+                root_name: "nerve_center".to_string(),
+                root_cwd: "/home/test/repos/nerve_center".to_string(),
+                common_dir: "/home/test/repos/nerve_center/.git".to_string(),
+                is_root: false,
+            },
+            GitProjectProbe {
+                name: "alpha".to_string(),
+                cwd: "/home/test/repos/alpha".to_string(),
+                branch: "main".to_string(),
+                root_name: "alpha".to_string(),
+                root_cwd: "/home/test/repos/alpha".to_string(),
+                common_dir: "/home/test/repos/alpha/.git".to_string(),
+                is_root: true,
+            },
+            GitProjectProbe {
+                name: "nerve_center".to_string(),
+                cwd: "/home/test/repos/nerve_center".to_string(),
+                branch: "main".to_string(),
+                root_name: "nerve_center".to_string(),
+                root_cwd: "/home/test/repos/nerve_center".to_string(),
+                common_dir: "/home/test/repos/nerve_center/.git".to_string(),
+                is_root: true,
+            },
+        ]);
 
         assert_eq!(
-            parse_projects(output, "/home/test"),
+            projects,
             vec![
                 ProjectEntry {
-                    name: "codex".to_string(),
-                    cwd: "/home/test/repos/codex".to_string(),
+                    name: "alpha".to_string(),
+                    cwd: "/home/test/repos/alpha".to_string(),
+                    branch: "main".to_string(),
+                    root_name: "alpha".to_string(),
+                    root_cwd: "/home/test/repos/alpha".to_string(),
+                    kind: ProjectKind::Root,
                 },
                 ProjectEntry {
-                    name: "hello".to_string(),
-                    cwd: "/home/test/repos/hello".to_string(),
+                    name: "nerve_center".to_string(),
+                    cwd: "/home/test/repos/nerve_center".to_string(),
+                    branch: "main".to_string(),
+                    root_name: "nerve_center".to_string(),
+                    root_cwd: "/home/test/repos/nerve_center".to_string(),
+                    kind: ProjectKind::Root,
                 },
                 ProjectEntry {
-                    name: "zeph".to_string(),
-                    cwd: "/home/test/repos/zeph".to_string(),
+                    name: "nerve_center.codex-hooks".to_string(),
+                    cwd: "/home/test/repos/nerve_center.codex-hooks".to_string(),
+                    branch: "codex-hooks".to_string(),
+                    root_name: "nerve_center".to_string(),
+                    root_cwd: "/home/test/repos/nerve_center".to_string(),
+                    kind: ProjectKind::Worktree,
                 },
             ]
         );
+        assert_eq!(projects[1].tree_label(), "nerve_center");
+        assert_eq!(projects[2].tree_label(), "  |- nerve_center.codex-hooks");
+    }
+
+    #[test]
+    fn sanitizes_worktree_slug_for_branch_and_directory_names() {
+        assert_eq!(sanitize_worktree_slug(" Codex Hooks "), "codex-hooks");
+        assert_eq!(sanitize_worktree_slug("review__2"), "review__2");
+        assert_eq!(sanitize_worktree_slug("***"), "");
     }
 }
