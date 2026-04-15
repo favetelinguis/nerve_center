@@ -68,6 +68,14 @@ enum InputMode {
     Command { tab: AppTab, command: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProjectCommand {
+    Remove,
+    Merge { target: Option<String> },
+    Pr { target: Option<String> },
+    Land { target: Option<String> },
+}
+
 #[derive(Debug)]
 pub struct App {
     rows: Vec<PaneRow>,
@@ -458,24 +466,122 @@ impl App {
     }
 
     fn execute_project_command(&mut self, command: &str) -> Result<()> {
-        match command {
-            "remove" => self.remove_selected_worktree(),
-            _ => bail!("unknown projects command: {command}"),
+        match parse_project_command(command)? {
+            ProjectCommand::Remove => self.remove_selected_worktree(),
+            ProjectCommand::Merge { target } => {
+                self.merge_selected_worktree(target.as_deref())?;
+                Ok(())
+            }
+            ProjectCommand::Pr { target } => {
+                self.create_pull_request_for_selected_worktree(target.as_deref())?;
+                Ok(())
+            }
+            ProjectCommand::Land { target } => {
+                self.merge_selected_worktree(target.as_deref())?;
+                self.remove_selected_worktree()
+            }
         }
     }
 
-    fn remove_selected_worktree(&mut self) -> Result<()> {
+    fn selected_linked_worktree(&self) -> Result<ProjectEntry> {
         let project = self
             .selected_project()
             .cloned()
             .ok_or_else(|| anyhow!("No projects found"))?;
 
         if project.kind != ProjectKind::Worktree {
-            bail!("remove only works on linked worktrees");
+            bail!("command only works on linked worktrees");
         }
         if matches!(project.branch.as_str(), "DETACHED" | "N/A") {
-            bail!("remove requires a branch-backed worktree");
+            bail!("command requires a branch-backed worktree");
         }
+
+        Ok(project)
+    }
+
+    fn resolve_target_branch(
+        &self,
+        project: &ProjectEntry,
+        explicit_target: Option<&str>,
+    ) -> Result<String> {
+        match explicit_target
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+        {
+            Some(target) => Ok(target.to_string()),
+            None => default_target_branch(&project.root_cwd, &self.projects),
+        }
+    }
+
+    fn merge_destination_cwd(&self, project: &ProjectEntry, target: &str) -> String {
+        self.projects
+            .iter()
+            .find(|candidate| candidate.root_cwd == project.root_cwd && candidate.branch == target)
+            .map(|candidate| candidate.cwd.clone())
+            .unwrap_or_else(|| project.root_cwd.clone())
+    }
+
+    fn merge_selected_worktree(&mut self, explicit_target: Option<&str>) -> Result<()> {
+        let project = self.selected_linked_worktree()?;
+        let target = self.resolve_target_branch(&project, explicit_target)?;
+        if target == project.branch {
+            bail!("target branch matches selected worktree branch");
+        }
+
+        ensure_clean_worktree(&project.cwd, "selected worktree")?;
+
+        let merge_cwd = self.merge_destination_cwd(&project, &target);
+        ensure_clean_worktree(&merge_cwd, "target worktree")?;
+
+        switch_to_branch(&merge_cwd, &target)?;
+        fast_forward_target_from_remote(&merge_cwd, &target)?;
+        fast_forward_merge_branch(&merge_cwd, &project.branch, &target)?;
+
+        self.reload_projects(Some(&project.cwd))?;
+        self.set_status(format!("Merged {} into {}", project.branch, target));
+        Ok(())
+    }
+
+    fn create_pull_request_for_selected_worktree(
+        &mut self,
+        explicit_target: Option<&str>,
+    ) -> Result<()> {
+        let project = self.selected_linked_worktree()?;
+        let target = self.resolve_target_branch(&project, explicit_target)?;
+        if target == project.branch {
+            bail!("target branch matches selected worktree branch");
+        }
+
+        ensure_clean_worktree(&project.cwd, "selected worktree")?;
+
+        let remote = branch_remote(&project.cwd, &project.branch)?
+            .ok_or_else(|| anyhow!("no git remote configured for {}", project.branch))?;
+        push_branch_to_remote(&project.cwd, &remote, &project.branch)?;
+        let pr_url = ensure_pull_request(&project.cwd, &project.branch, &target)?;
+
+        self.set_status(format!(
+            "PR ready for {} -> {}: {}",
+            project.branch, target, pr_url
+        ));
+        Ok(())
+    }
+
+    fn remove_selected_worktree(&mut self) -> Result<()> {
+        let project = self.selected_linked_worktree().map_err(|error| {
+            if error
+                .to_string()
+                .contains("command only works on linked worktrees")
+            {
+                anyhow!("remove only works on linked worktrees")
+            } else if error
+                .to_string()
+                .contains("command requires a branch-backed worktree")
+            {
+                anyhow!("remove requires a branch-backed worktree")
+            } else {
+                error
+            }
+        })?;
 
         run_git_worktree_remove(&project.root_cwd, &project.cwd)?;
         run_git_branch_delete(&project.root_cwd, &project.branch)?;
@@ -776,6 +882,284 @@ fn build_project_entries(probes: Vec<GitProjectProbe>) -> Vec<ProjectEntry> {
     projects
 }
 
+fn parse_project_command(command: &str) -> Result<ProjectCommand> {
+    let mut parts = command.split_whitespace();
+    let Some(name) = parts.next() else {
+        bail!("empty projects command")
+    };
+    let target = parts.next().map(str::to_string);
+    if parts.next().is_some() {
+        bail!("too many arguments for projects command: {command}")
+    }
+
+    match name {
+        "remove" => {
+            if target.is_some() {
+                bail!("remove does not take a target branch")
+            }
+            Ok(ProjectCommand::Remove)
+        }
+        "merge" => Ok(ProjectCommand::Merge { target }),
+        "pr" => Ok(ProjectCommand::Pr { target }),
+        "land" => Ok(ProjectCommand::Land { target }),
+        _ => bail!("unknown projects command: {command}"),
+    }
+}
+
+fn default_target_branch(root_cwd: &str, projects: &[ProjectEntry]) -> Result<String> {
+    if let Some(branch) = remote_default_branch(root_cwd)? {
+        return Ok(branch);
+    }
+
+    for branch in ["main", "master"] {
+        if local_branch_exists(root_cwd, branch)? {
+            return Ok(branch.to_string());
+        }
+    }
+
+    if let Some(branch) = projects.iter().find_map(|project| {
+        (project.root_cwd == root_cwd
+            && project.kind == ProjectKind::Root
+            && !matches!(project.branch.as_str(), "DETACHED" | "N/A"))
+        .then(|| project.branch.clone())
+    }) {
+        return Ok(branch);
+    }
+
+    bail!("could not determine default branch for {root_cwd}")
+}
+
+fn remote_default_branch(root_cwd: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            root_cwd,
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])
+        .output()
+        .with_context(|| format!("failed to inspect remote default branch for {root_cwd}"))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let branch = String::from_utf8(output.stdout)
+        .context("git symbolic-ref stdout was not valid UTF-8")?
+        .trim()
+        .to_string();
+    Ok(branch.rsplit('/').next().map(str::to_string))
+}
+
+fn local_branch_exists(root_cwd: &str, branch: &str) -> Result<bool> {
+    let status = Command::new("git")
+        .args([
+            "-C",
+            root_cwd,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .status()
+        .with_context(|| format!("failed to inspect branch {branch} in {root_cwd}"))?;
+    Ok(status.success())
+}
+
+fn ensure_clean_worktree(cwd: &str, label: &str) -> Result<()> {
+    let output = Command::new("git")
+        .args(["-C", cwd, "status", "--porcelain"])
+        .output()
+        .with_context(|| format!("failed to read git status for {cwd}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("git status failed for {cwd}: {}", stderr.trim());
+    }
+
+    let status =
+        String::from_utf8(output.stdout).context("git status stdout was not valid UTF-8")?;
+    if status.trim().is_empty() {
+        return Ok(());
+    }
+
+    bail!("{label} has uncommitted or untracked changes")
+}
+
+fn switch_to_branch(cwd: &str, branch: &str) -> Result<()> {
+    if read_branch_name(Path::new(cwd))? == branch {
+        return Ok(());
+    }
+
+    run_git(
+        cwd,
+        &["switch", branch],
+        &format!("failed to switch {cwd} to {branch}"),
+    )
+}
+
+fn branch_remote(cwd: &str, branch: &str) -> Result<Option<String>> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            cwd,
+            "config",
+            "--get",
+            &format!("branch.{branch}.remote"),
+        ])
+        .output()
+        .with_context(|| format!("failed to inspect remote for branch {branch} in {cwd}"))?;
+
+    if output.status.success() {
+        let remote = String::from_utf8(output.stdout)
+            .context("git config stdout was not valid UTF-8")?
+            .trim()
+            .to_string();
+        if !remote.is_empty() {
+            return Ok(Some(remote));
+        }
+    }
+
+    let remotes = Command::new("git")
+        .args(["-C", cwd, "remote"])
+        .output()
+        .with_context(|| format!("failed to list remotes for {cwd}"))?;
+    if !remotes.status.success() {
+        return Ok(None);
+    }
+
+    let stdout =
+        String::from_utf8(remotes.stdout).context("git remote stdout was not valid UTF-8")?;
+    Ok(stdout
+        .lines()
+        .find(|remote| *remote == "origin")
+        .map(str::to_string))
+}
+
+fn remote_tracking_ref_exists(cwd: &str, remote: &str, branch: &str) -> Result<bool> {
+    let status = Command::new("git")
+        .args([
+            "-C",
+            cwd,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/{remote}/{branch}"),
+        ])
+        .status()
+        .with_context(|| format!("failed to inspect remote branch {remote}/{branch} in {cwd}"))?;
+    Ok(status.success())
+}
+
+fn fast_forward_target_from_remote(cwd: &str, target: &str) -> Result<()> {
+    let Some(remote) = branch_remote(cwd, target)? else {
+        return Ok(());
+    };
+
+    run_git(
+        cwd,
+        &["fetch", &remote, target],
+        &format!("failed to fetch {remote}/{target} for {cwd}"),
+    )?;
+
+    if !remote_tracking_ref_exists(cwd, &remote, target)? {
+        return Ok(());
+    }
+
+    let remote_ref = format!("{remote}/{target}");
+    run_git(
+        cwd,
+        &["merge", "--ff-only", &remote_ref],
+        &format!("failed to fast-forward {target} from {remote_ref}"),
+    )
+}
+
+fn fast_forward_merge_branch(cwd: &str, source_branch: &str, target: &str) -> Result<()> {
+    run_git(
+        cwd,
+        &["merge", "--ff-only", source_branch],
+        &format!("failed to fast-forward merge {source_branch} into {target}"),
+    )
+}
+
+fn push_branch_to_remote(cwd: &str, remote: &str, branch: &str) -> Result<()> {
+    run_git(
+        cwd,
+        &["push", "-u", remote, branch],
+        &format!("failed to push {branch} to {remote}"),
+    )
+}
+
+fn ensure_pull_request(cwd: &str, branch: &str, target: &str) -> Result<String> {
+    if let Some(url) = existing_pull_request_url(cwd)? {
+        return Ok(url);
+    }
+
+    run_gh_capture(
+        cwd,
+        &["pr", "create", "--base", target, "--head", branch, "--fill"],
+        &format!("failed to create PR for {branch} -> {target}"),
+    )
+    .map(|url| url.trim().to_string())
+}
+
+fn existing_pull_request_url(cwd: &str) -> Result<Option<String>> {
+    let output = Command::new("gh")
+        .args(["pr", "view", "--json", "url", "--jq", ".url"])
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("failed to inspect PR state for {cwd}"))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let url = String::from_utf8(output.stdout)
+        .context("gh pr view stdout was not valid UTF-8")?
+        .trim()
+        .to_string();
+    if url.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(url))
+    }
+}
+
+fn run_git(cwd: &str, args: &[&str], failure_context: &str) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .with_context(|| failure_context.to_string())?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!("{failure_context}: {}", stderr.trim())
+}
+
+fn run_gh_capture(cwd: &str, args: &[&str], failure_context: &str) -> Result<String> {
+    let output = Command::new("gh")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .with_context(|| failure_context.to_string())?;
+
+    if output.status.success() {
+        return String::from_utf8(output.stdout)
+            .context("gh stdout was not valid UTF-8")
+            .map(|stdout| stdout.trim().to_string());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    bail!("{failure_context}: {}", stderr.trim())
+}
+
 fn sanitize_worktree_slug(input: &str) -> String {
     let mut slug = String::new();
     let mut previous_dash = false;
@@ -842,6 +1226,7 @@ fn run_git_branch_delete(root_cwd: &str, branch: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -851,7 +1236,8 @@ mod tests {
 
     use super::{
         App, AppTab, GitProjectProbe, Mode, ProjectEntry, ProjectKind, build_project_entries,
-        run_git_branch_delete, run_git_worktree_remove, sanitize_worktree_slug,
+        parse_project_command, run_git_branch_delete, run_git_worktree_remove,
+        sanitize_worktree_slug,
     };
     use crate::input::AppAction;
     use crate::wezterm::{NewTabCommand, PaneInfo, SplitDirection, WeztermClient};
@@ -1219,6 +1605,124 @@ mod tests {
     }
 
     #[test]
+    fn parses_projects_commands_with_optional_target() {
+        assert_eq!(
+            parse_project_command("merge").expect("merge should parse"),
+            super::ProjectCommand::Merge { target: None }
+        );
+        assert_eq!(
+            parse_project_command("merge main").expect("merge target should parse"),
+            super::ProjectCommand::Merge {
+                target: Some("main".to_string())
+            }
+        );
+        assert_eq!(
+            parse_project_command("pr main").expect("pr target should parse"),
+            super::ProjectCommand::Pr {
+                target: Some("main".to_string())
+            }
+        );
+        assert_eq!(
+            parse_project_command("land").expect("land should parse"),
+            super::ProjectCommand::Land { target: None }
+        );
+        assert!(parse_project_command("remove main").is_err());
+    }
+
+    #[test]
+    fn merge_command_fast_forwards_main_and_keeps_worktree_selected() {
+        let fixture = create_worktree_fixture("merge-command");
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app = App::load_with_projects(&mut wezterm, fixture.projects.clone())
+            .expect("app should load");
+        app.apply(AppAction::ProjectMoveDown, &mut wezterm)
+            .expect("selection should move to worktree");
+
+        app.execute_project_command("merge")
+            .expect("merge should succeed");
+
+        assert_eq!(head_message(&fixture.root), "feature change");
+        assert_eq!(
+            app.projects()[app.selected_project_index()].cwd,
+            root_as_str(&fixture.worktree)
+        );
+        assert!(app.status_line().contains("Merged feature into main"));
+    }
+
+    #[test]
+    fn land_command_merges_and_removes_worktree() {
+        let fixture = create_worktree_fixture("land-command");
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app = App::load_with_projects(&mut wezterm, fixture.projects.clone())
+            .expect("app should load");
+        app.apply(AppAction::ProjectMoveDown, &mut wezterm)
+            .expect("selection should move to worktree");
+
+        app.execute_project_command("land")
+            .expect("land should succeed");
+
+        assert_eq!(head_message(&fixture.root), "feature change");
+        assert!(!fixture.worktree.exists());
+        assert!(!branch_exists(&fixture.root, "feature"));
+        assert!(app.status_line().contains("Removed worktree"));
+    }
+
+    #[test]
+    fn pr_command_pushes_branch_and_creates_pull_request() {
+        let fixture = create_worktree_fixture("pr-command");
+        git(
+            &fixture.root,
+            &["remote", "add", "origin", root_as_str(&fixture.remote)],
+        );
+        git(&fixture.root, &["push", "-u", "origin", "main"]);
+
+        let fake_bin = test_sandbox("fake-gh-bin");
+        let gh_path = fake_bin.join("gh");
+        write_file(
+            &gh_path,
+            "#!/bin/sh
+if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then
+  exit 1
+fi
+if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"create\" ]; then
+  printf '%s\n' 'https://example.com/pr/123'
+  exit 0
+fi
+printf '%s\n' \"unexpected gh invocation: $*\" >&2
+exit 1
+",
+        );
+        chmod_executable(&gh_path);
+        let original_path = env::var("PATH").unwrap_or_default();
+        let patched_path = format!("{}:{}", fake_bin.display(), original_path);
+        unsafe {
+            env::set_var("PATH", patched_path);
+        }
+
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app = App::load_with_projects(&mut wezterm, fixture.projects.clone())
+            .expect("app should load");
+        app.apply(AppAction::ProjectMoveDown, &mut wezterm)
+            .expect("selection should move to worktree");
+
+        let result = app.execute_project_command("pr");
+
+        unsafe {
+            env::set_var("PATH", original_path);
+        }
+        result.expect("pr should succeed");
+
+        assert!(remote_branch_exists(&fixture.remote, "feature"));
+        assert!(
+            app.status_line()
+                .contains("PR ready for feature -> main: https://example.com/pr/123")
+        );
+    }
+
+    #[test]
     fn switching_tabs_preserves_pane_mode() {
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 1, 1)]]);
@@ -1420,6 +1924,44 @@ mod tests {
             .expect_err("branch should still be checked out in dirty worktree");
     }
 
+    #[derive(Debug)]
+    struct WorktreeFixture {
+        root: PathBuf,
+        worktree: PathBuf,
+        remote: PathBuf,
+        projects: Vec<ProjectEntry>,
+    }
+
+    fn create_worktree_fixture(name: &str) -> WorktreeFixture {
+        let sandbox = test_sandbox(name);
+        let root = sandbox.join("repo");
+        let worktree = sandbox.join("repo.feature");
+        let remote = sandbox.join("remote.git");
+
+        git(
+            &sandbox,
+            &["init", "--initial-branch=main", root_as_str(&root)],
+        );
+        write_file(&root.join("tracked.txt"), "hello\n");
+        git_commit_all(&root, "init");
+        git(
+            &root,
+            &["worktree", "add", "-b", "feature", root_as_str(&worktree)],
+        );
+        write_file(&worktree.join("tracked.txt"), "hello\nfeature\n");
+        git_commit_all(&worktree, "feature change");
+        git(&sandbox, &["init", "--bare", root_as_str(&remote)]);
+
+        let projects = super::discover_projects_in(root_as_str(&sandbox))
+            .expect("projects should be discovered");
+        WorktreeFixture {
+            root,
+            worktree,
+            remote,
+            projects,
+        }
+    }
+
     fn test_sandbox(name: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1444,6 +1986,81 @@ mod tests {
             "git command failed: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         );
+    }
+
+    fn git_commit_all(workdir: &Path, message: &str) {
+        git(
+            workdir,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "add",
+                ".",
+            ],
+        );
+        git(
+            workdir,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                message,
+            ],
+        );
+    }
+
+    fn head_message(workdir: &Path) -> String {
+        let output = Command::new("git")
+            .args(["log", "-1", "--pretty=%s"])
+            .current_dir(workdir)
+            .output()
+            .expect("git log should start");
+        assert!(output.status.success(), "git log should succeed");
+        String::from_utf8(output.stdout)
+            .expect("git log output should be utf-8")
+            .trim()
+            .to_string()
+    }
+
+    fn branch_exists(workdir: &Path, branch: &str) -> bool {
+        Command::new("git")
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .current_dir(workdir)
+            .status()
+            .expect("git show-ref should start")
+            .success()
+    }
+
+    fn remote_branch_exists(remote_repo: &Path, branch: &str) -> bool {
+        Command::new("git")
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ])
+            .current_dir(remote_repo)
+            .status()
+            .expect("git show-ref should start")
+            .success()
+    }
+
+    fn chmod_executable(path: &Path) {
+        let output = Command::new("chmod")
+            .args(["+x", root_as_str(path)])
+            .output()
+            .expect("chmod should start");
+        assert!(output.status.success(), "chmod should succeed");
     }
 
     fn write_file(path: &Path, content: &str) {
