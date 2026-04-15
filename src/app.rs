@@ -3,6 +3,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -43,10 +44,20 @@ pub struct ProjectEntry {
 }
 
 impl ProjectEntry {
+    fn display_name(&self) -> &str {
+        match self.kind {
+            ProjectKind::Root => self.name.as_str(),
+            ProjectKind::Worktree if !matches!(self.branch.as_str(), "DETACHED" | "N/A") => {
+                self.branch.as_str()
+            }
+            ProjectKind::Worktree => self.name.as_str(),
+        }
+    }
+
     pub fn tree_label(&self) -> String {
         match self.kind {
-            ProjectKind::Root => self.name.clone(),
-            ProjectKind::Worktree => format!("  |- {}", self.name),
+            ProjectKind::Root => self.display_name().to_string(),
+            ProjectKind::Worktree => format!("  |- {}", self.display_name()),
         }
     }
 }
@@ -64,7 +75,7 @@ impl PaneRow {
 
 #[derive(Debug, Clone)]
 enum InputMode {
-    WorktreeSlug { slug: String },
+    WorktreeBranch { branch: String },
     Command { tab: AppTab, command: String },
 }
 
@@ -193,12 +204,12 @@ impl App {
 
     pub fn input_line(&self) -> String {
         match self.input_mode.as_ref() {
-            Some(InputMode::WorktreeSlug { slug }) => {
+            Some(InputMode::WorktreeBranch { branch }) => {
                 let root_name = self
                     .selected_project()
                     .map(|project| project.root_name.as_str())
                     .unwrap_or("-");
-                format!("Create worktree for {root_name}: {slug}")
+                format!("Create worktree branch for {root_name}: {branch}")
             }
             Some(InputMode::Command { tab, command }) => {
                 let scope = match tab {
@@ -216,7 +227,7 @@ impl App {
             }
             None => match self.active_tab {
                 AppTab::Projects => {
-                    "Ctrl-W create worktree | : command on selected project".to_string()
+                    "Ctrl-W create worktree branch | : command on selected project".to_string()
                 }
                 AppTab::Panes => ": command on active tab".to_string(),
             },
@@ -367,10 +378,10 @@ impl App {
         };
         let root_name = project.root_name.clone();
 
-        self.input_mode = Some(InputMode::WorktreeSlug {
-            slug: String::new(),
+        self.input_mode = Some(InputMode::WorktreeBranch {
+            branch: String::new(),
         });
-        self.set_status(format!("Create worktree for {root_name}"));
+        self.set_status(format!("Create worktree branch for {root_name}"));
     }
 
     fn start_command_input(&mut self) {
@@ -387,7 +398,7 @@ impl App {
         };
 
         match input_mode {
-            InputMode::WorktreeSlug { slug } => slug.push(c),
+            InputMode::WorktreeBranch { branch } => branch.push(c),
             InputMode::Command { command, .. } => command.push(c),
         }
         self.last_error = None;
@@ -399,8 +410,8 @@ impl App {
         };
 
         match input_mode {
-            InputMode::WorktreeSlug { slug } => {
-                slug.pop();
+            InputMode::WorktreeBranch { branch } => {
+                branch.pop();
             }
             InputMode::Command { command, .. } => {
                 command.pop();
@@ -420,7 +431,7 @@ impl App {
         };
 
         match input_mode {
-            InputMode::WorktreeSlug { slug } => self.confirm_worktree_input(&slug),
+            InputMode::WorktreeBranch { branch } => self.confirm_worktree_input(&branch),
             InputMode::Command { tab, command } => {
                 self.input_mode = None;
                 self.execute_command(tab, &command)
@@ -428,27 +439,29 @@ impl App {
         }
     }
 
-    fn confirm_worktree_input(&mut self, slug: &str) -> Result<()> {
+    fn confirm_worktree_input(&mut self, branch: &str) -> Result<()> {
         let Some(project) = self.selected_project() else {
             self.record_error("No projects found");
             return Ok(());
         };
 
-        let slug = sanitize_worktree_slug(slug);
-        if slug.is_empty() {
-            self.record_error("Worktree slug is empty");
+        let Some(branch) = normalize_worktree_branch_input(branch) else {
+            self.record_error("Worktree branch is empty");
             return Ok(());
-        }
+        };
 
         let root_cwd = project.root_cwd.clone();
-        let root_name = project.root_name.clone();
-        let target_cwd = format!("{}/{}.{}", self.repos_root, root_name, slug);
+        let target_cwd = generate_worktree_cwd(&self.repos_root)?;
 
-        run_git_worktree_add(&root_cwd, &slug, &target_cwd)?;
+        run_git_worktree_add(&root_cwd, &branch, &target_cwd)?;
 
         self.input_mode = None;
         self.reload_projects(Some(&target_cwd))?;
-        self.set_status(format!("Created worktree {} on {}", root_name, slug));
+        let worktree_name = Path::new(&target_cwd)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| target_cwd.clone());
+        self.set_status(format!("Created worktree {worktree_name} on {branch}"));
         Ok(())
     }
 
@@ -1160,25 +1173,35 @@ fn run_gh_capture(cwd: &str, args: &[&str], failure_context: &str) -> Result<Str
     bail!("{failure_context}: {}", stderr.trim())
 }
 
-fn sanitize_worktree_slug(input: &str) -> String {
-    let mut slug = String::new();
-    let mut previous_dash = false;
+fn normalize_worktree_branch_input(input: &str) -> Option<String> {
+    let branch = input.trim();
+    (!branch.is_empty()).then(|| branch.to_string())
+}
 
-    for c in input.trim().chars() {
-        let c = c.to_ascii_lowercase();
-        if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-            slug.push(c);
-            previous_dash = false;
-            continue;
-        }
+fn generate_worktree_cwd(repos_root: &str) -> Result<String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before unix epoch")?;
+    let base = format!(
+        "wt-{}-{:03}-{}",
+        now.as_secs(),
+        now.subsec_millis(),
+        std::process::id()
+    );
 
-        if !previous_dash {
-            slug.push('-');
-            previous_dash = true;
+    for attempt in 0..1000 {
+        let name = if attempt == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{attempt}")
+        };
+        let cwd = format!("{repos_root}/{name}");
+        if !Path::new(&cwd).exists() {
+            return Ok(cwd);
         }
     }
 
-    slug.trim_matches('-').to_string()
+    bail!("failed to allocate a unique worktree directory name")
 }
 
 fn run_git_worktree_add(root_cwd: &str, slug: &str, target_cwd: &str) -> Result<()> {
@@ -1237,7 +1260,6 @@ mod tests {
     use super::{
         App, AppTab, GitProjectProbe, Mode, ProjectEntry, ProjectKind, build_project_entries,
         parse_project_command, run_git_branch_delete, run_git_worktree_remove,
-        sanitize_worktree_slug,
     };
     use crate::input::AppAction;
     use crate::wezterm::{NewTabCommand, PaneInfo, SplitDirection, WeztermClient};
@@ -1567,7 +1589,10 @@ mod tests {
             .expect("input should accept text");
 
         assert!(app.is_input_active());
-        assert!(app.input_line().contains("Create worktree for alpha: x"));
+        assert!(
+            app.input_line()
+                .contains("Create worktree branch for alpha: x")
+        );
 
         app.apply(AppAction::CancelInput, &mut wezterm)
             .expect("input should cancel");
@@ -1648,6 +1673,44 @@ mod tests {
             root_as_str(&fixture.worktree)
         );
         assert!(app.status_line().contains("Merged feature into main"));
+    }
+
+    #[test]
+    fn ctrl_w_preserves_branch_names_with_slashes_and_generates_wt_directory() {
+        let sandbox = test_sandbox("create-worktree-raw-branch");
+        let root = sandbox.join("repo");
+
+        git(
+            &sandbox,
+            &["init", "--initial-branch=main", root_as_str(&root)],
+        );
+        write_file(&root.join("tracked.txt"), "hello\n");
+        git_commit_all(&root, "init");
+
+        let projects = super::discover_projects_in(root_as_str(&sandbox))
+            .expect("projects should be discovered");
+
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app = App::load_with_projects(&mut wezterm, projects).expect("app should load");
+
+        app.apply(AppAction::StartCreateWorktreeInput, &mut wezterm)
+            .expect("worktree input should start");
+        for c in "feature/BOOST-3432".chars() {
+            app.apply(AppAction::EditInput(c), &mut wezterm)
+                .expect("input should accept branch text");
+        }
+        app.apply(AppAction::ConfirmInput, &mut wezterm)
+            .expect("worktree creation should succeed");
+
+        let created = &app.projects()[app.selected_project_index()];
+        assert_eq!(created.branch, "feature/BOOST-3432");
+        assert!(
+            created
+                .cwd
+                .starts_with(&format!("{}/wt-", sandbox.display()))
+        );
+        assert_eq!(created.tree_label(), "  |- feature/BOOST-3432");
     }
 
     #[test]
@@ -1862,14 +1925,16 @@ exit 1
             ]
         );
         assert_eq!(projects[1].tree_label(), "nerve_center");
-        assert_eq!(projects[2].tree_label(), "  |- nerve_center.codex-hooks");
+        assert_eq!(projects[2].tree_label(), "  |- codex-hooks");
     }
 
     #[test]
-    fn sanitizes_worktree_slug_for_branch_and_directory_names() {
-        assert_eq!(sanitize_worktree_slug(" Codex Hooks "), "codex-hooks");
-        assert_eq!(sanitize_worktree_slug("review__2"), "review__2");
-        assert_eq!(sanitize_worktree_slug("***"), "");
+    fn trims_worktree_branch_input_without_renaming_it() {
+        assert_eq!(
+            super::normalize_worktree_branch_input(" feature/BOOST-3432 "),
+            Some("feature/BOOST-3432".to_string())
+        );
+        assert_eq!(super::normalize_worktree_branch_input("   "), None);
     }
 
     #[test]

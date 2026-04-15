@@ -2,9 +2,9 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs};
-use ratatui::{Frame, symbols};
+use ratatui::{symbols, Frame};
 
-use crate::app::{App, AppTab, Mode};
+use crate::app::{App, AppTab, Mode, ProjectKind};
 
 pub fn render(frame: &mut Frame, app: &App) {
     let layout = Layout::default()
@@ -64,11 +64,15 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             .iter()
             .zip(labels)
             .map(|(project, label)| {
-                ListItem::new(format!(
-                    "{label:<label_width$}  {}",
-                    project.branch,
-                    label_width = label_width
-                ))
+                let text = match project.kind {
+                    ProjectKind::Root => format!(
+                        "{label:<label_width$}  {}",
+                        project.branch,
+                        label_width = label_width
+                    ),
+                    ProjectKind::Worktree => label,
+                };
+                ListItem::new(text)
             })
             .collect::<Vec<_>>()
     };
