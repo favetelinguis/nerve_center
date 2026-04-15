@@ -2,7 +2,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Tabs};
-use ratatui::{symbols, Frame};
+use ratatui::{Frame, symbols};
 
 use crate::app::{App, AppTab, Mode, ProjectKind};
 
@@ -56,22 +56,30 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         let labels = app
             .projects()
             .iter()
-            .map(|project| project.tree_label())
+            .map(|project| match project.kind {
+                ProjectKind::Root => project.name.clone(),
+                ProjectKind::Worktree => format!("  |- {}", project.name),
+            })
             .collect::<Vec<_>>();
         let label_width = labels.iter().map(|label| label.len()).max().unwrap_or(0);
+        let branch_width = app
+            .projects()
+            .iter()
+            .map(|project| project.branch.len())
+            .max()
+            .unwrap_or(0);
 
         app.projects()
             .iter()
             .zip(labels)
             .map(|(project, label)| {
-                let text = match project.kind {
-                    ProjectKind::Root => format!(
-                        "{label:<label_width$}  {}",
-                        project.branch,
-                        label_width = label_width
-                    ),
-                    ProjectKind::Worktree => label,
-                };
+                let text = format!(
+                    "{label:<label_width$}  {branch:<branch_width$}  {status}",
+                    branch = project.branch,
+                    status = project.status_summary.display_text(),
+                    label_width = label_width,
+                    branch_width = branch_width,
+                );
                 ListItem::new(text)
             })
             .collect::<Vec<_>>()

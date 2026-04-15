@@ -38,27 +38,63 @@ pub struct ProjectEntry {
     pub name: String,
     pub cwd: String,
     pub branch: String,
+    pub status_summary: ProjectStatusSummary,
     pub root_name: String,
     pub root_cwd: String,
     pub kind: ProjectKind,
 }
 
-impl ProjectEntry {
-    fn display_name(&self) -> &str {
-        match self.kind {
-            ProjectKind::Root => self.name.as_str(),
-            ProjectKind::Worktree if !matches!(self.branch.as_str(), "DETACHED" | "N/A") => {
-                self.branch.as_str()
-            }
-            ProjectKind::Worktree => self.name.as_str(),
-        }
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProjectStatusSummary {
+    pub staged: usize,
+    pub modified: usize,
+    pub deleted: usize,
+    pub untracked: usize,
+    pub conflicts: usize,
+    pub ahead: usize,
+    pub behind: usize,
+}
+
+impl ProjectStatusSummary {
+    fn has_local_changes(&self) -> bool {
+        self.staged > 0
+            || self.modified > 0
+            || self.deleted > 0
+            || self.untracked > 0
+            || self.conflicts > 0
     }
 
-    pub fn tree_label(&self) -> String {
-        match self.kind {
-            ProjectKind::Root => self.display_name().to_string(),
-            ProjectKind::Worktree => format!("  |- {}", self.display_name()),
+    pub fn display_text(&self) -> String {
+        let mut parts = Vec::new();
+
+        if !self.has_local_changes() {
+            parts.push("clean".to_string());
+        } else {
+            if self.staged > 0 {
+                parts.push(format!("S{}", self.staged));
+            }
+            if self.modified > 0 {
+                parts.push(format!("M{}", self.modified));
+            }
+            if self.deleted > 0 {
+                parts.push(format!("D{}", self.deleted));
+            }
+            if self.untracked > 0 {
+                parts.push(format!("?{}", self.untracked));
+            }
+            if self.conflicts > 0 {
+                parts.push(format!("U{}", self.conflicts));
+            }
         }
+
+        if self.ahead > 0 {
+            parts.push(format!("^{}", self.ahead));
+        }
+        if self.behind > 0 {
+            parts.push(format!("v{}", self.behind));
+        }
+
+        parts.join(" ")
     }
 }
 
@@ -753,10 +789,17 @@ struct GitProjectProbe {
     name: String,
     cwd: String,
     branch: String,
+    status_summary: ProjectStatusSummary,
     root_name: String,
     root_cwd: String,
     common_dir: String,
     is_root: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitStatusProbe {
+    branch: String,
+    status_summary: ProjectStatusSummary,
 }
 
 fn inspect_git_project(path: &Path) -> Result<Option<GitProjectProbe>> {
@@ -812,11 +855,13 @@ fn inspect_git_project(path: &Path) -> Result<Option<GitProjectProbe>> {
         .context("project path did not have a final path component")?
         .to_string_lossy()
         .into_owned();
+    let status = read_project_status(path)?;
 
     Ok(Some(GitProjectProbe {
         name,
         cwd,
-        branch: read_branch_name(path)?,
+        branch: status.branch,
+        status_summary: status.status_summary,
         root_name,
         root_cwd: root_cwd.to_string_lossy().into_owned(),
         common_dir: common_dir.to_string_lossy().into_owned(),
@@ -856,6 +901,102 @@ fn read_branch_name(path: &Path) -> Result<String> {
     }
 }
 
+fn read_project_status(path: &Path) -> Result<GitStatusProbe> {
+    let output = Command::new("git")
+        .arg("--no-optional-locks")
+        .arg("-C")
+        .arg(path)
+        .args(["status", "--porcelain=v2", "--branch"])
+        .output()
+        .with_context(|| format!("failed to read git status for {}", path.display()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "git status failed for {}: {}",
+            path.display(),
+            stderr.trim()
+        );
+    }
+
+    let stdout =
+        String::from_utf8(output.stdout).context("git status stdout was not valid UTF-8")?;
+    parse_project_status_output(&stdout)
+}
+
+fn parse_project_status_output(stdout: &str) -> Result<GitStatusProbe> {
+    let mut branch = "N/A".to_string();
+    let mut status_summary = ProjectStatusSummary::default();
+
+    for line in stdout.lines() {
+        if let Some(head) = line.strip_prefix("# branch.head ") {
+            branch = if head == "(detached)" {
+                "DETACHED".to_string()
+            } else {
+                head.to_string()
+            };
+            continue;
+        }
+
+        if let Some(counts) = line.strip_prefix("# branch.ab +") {
+            let (ahead, behind) = counts
+                .split_once(" -")
+                .context("git status branch.ab header was malformed")?;
+            status_summary.ahead = ahead
+                .parse()
+                .context("git status ahead count was not a number")?;
+            status_summary.behind = behind
+                .parse()
+                .context("git status behind count was not a number")?;
+            continue;
+        }
+
+        if line.starts_with("u ") {
+            status_summary.conflicts += 1;
+            continue;
+        }
+
+        if line.starts_with("? ") {
+            status_summary.untracked += 1;
+            continue;
+        }
+
+        if !matches!(line.as_bytes().first(), Some(b'1' | b'2')) {
+            continue;
+        }
+
+        let xy = line
+            .split_whitespace()
+            .nth(1)
+            .context("git status record missing XY field")?;
+        let mut xy_chars = xy.chars();
+        let staged_status = xy_chars
+            .next()
+            .context("git status XY field was missing staged status")?;
+        let worktree_status = xy_chars
+            .next()
+            .context("git status XY field was missing worktree status")?;
+        if xy_chars.next().is_some() {
+            bail!("git status XY field was longer than expected");
+        }
+
+        if staged_status != '.' {
+            status_summary.staged += 1;
+        }
+        if staged_status == 'D' || worktree_status == 'D' {
+            status_summary.deleted += 1;
+        }
+        if worktree_status != '.' && worktree_status != 'D' {
+            status_summary.modified += 1;
+        }
+    }
+
+    Ok(GitStatusProbe {
+        branch,
+        status_summary,
+    })
+}
+
 fn build_project_entries(probes: Vec<GitProjectProbe>) -> Vec<ProjectEntry> {
     let mut groups = BTreeMap::<String, Vec<GitProjectProbe>>::new();
     for probe in probes {
@@ -881,6 +1022,7 @@ fn build_project_entries(probes: Vec<GitProjectProbe>) -> Vec<ProjectEntry> {
                 name: probe.name,
                 cwd: probe.cwd,
                 branch: probe.branch,
+                status_summary: probe.status_summary,
                 root_name: probe.root_name,
                 root_cwd: probe.root_cwd,
                 kind: if probe.is_root {
@@ -1258,8 +1400,9 @@ mod tests {
     use anyhow::Result;
 
     use super::{
-        App, AppTab, GitProjectProbe, Mode, ProjectEntry, ProjectKind, build_project_entries,
-        parse_project_command, run_git_branch_delete, run_git_worktree_remove,
+        App, AppTab, GitProjectProbe, Mode, ProjectEntry, ProjectKind, ProjectStatusSummary,
+        build_project_entries, parse_project_command, parse_project_status_output,
+        run_git_branch_delete, run_git_worktree_remove,
     };
     use crate::input::AppAction;
     use crate::wezterm::{NewTabCommand, PaneInfo, SplitDirection, WeztermClient};
@@ -1365,6 +1508,7 @@ mod tests {
                 name: "alpha".to_string(),
                 cwd: "/tmp/repos/alpha".to_string(),
                 branch: "main".to_string(),
+                status_summary: ProjectStatusSummary::default(),
                 root_name: "alpha".to_string(),
                 root_cwd: "/tmp/repos/alpha".to_string(),
                 kind: ProjectKind::Root,
@@ -1373,6 +1517,7 @@ mod tests {
                 name: "beta".to_string(),
                 cwd: "/tmp/repos/beta".to_string(),
                 branch: "feature".to_string(),
+                status_summary: ProjectStatusSummary::default(),
                 root_name: "beta".to_string(),
                 root_cwd: "/tmp/repos/beta".to_string(),
                 kind: ProjectKind::Root,
@@ -1710,7 +1855,7 @@ mod tests {
                 .cwd
                 .starts_with(&format!("{}/wt-", sandbox.display()))
         );
-        assert_eq!(created.tree_label(), "  |- feature/BOOST-3432");
+        assert!(created.name.starts_with("wt-"));
     }
 
     #[test]
@@ -1870,6 +2015,7 @@ exit 1
                 name: "nerve_center.codex-hooks".to_string(),
                 cwd: "/home/test/repos/nerve_center.codex-hooks".to_string(),
                 branch: "codex-hooks".to_string(),
+                status_summary: ProjectStatusSummary::default(),
                 root_name: "nerve_center".to_string(),
                 root_cwd: "/home/test/repos/nerve_center".to_string(),
                 common_dir: "/home/test/repos/nerve_center/.git".to_string(),
@@ -1879,6 +2025,7 @@ exit 1
                 name: "alpha".to_string(),
                 cwd: "/home/test/repos/alpha".to_string(),
                 branch: "main".to_string(),
+                status_summary: ProjectStatusSummary::default(),
                 root_name: "alpha".to_string(),
                 root_cwd: "/home/test/repos/alpha".to_string(),
                 common_dir: "/home/test/repos/alpha/.git".to_string(),
@@ -1888,6 +2035,7 @@ exit 1
                 name: "nerve_center".to_string(),
                 cwd: "/home/test/repos/nerve_center".to_string(),
                 branch: "main".to_string(),
+                status_summary: ProjectStatusSummary::default(),
                 root_name: "nerve_center".to_string(),
                 root_cwd: "/home/test/repos/nerve_center".to_string(),
                 common_dir: "/home/test/repos/nerve_center/.git".to_string(),
@@ -1902,6 +2050,7 @@ exit 1
                     name: "alpha".to_string(),
                     cwd: "/home/test/repos/alpha".to_string(),
                     branch: "main".to_string(),
+                    status_summary: ProjectStatusSummary::default(),
                     root_name: "alpha".to_string(),
                     root_cwd: "/home/test/repos/alpha".to_string(),
                     kind: ProjectKind::Root,
@@ -1910,6 +2059,7 @@ exit 1
                     name: "nerve_center".to_string(),
                     cwd: "/home/test/repos/nerve_center".to_string(),
                     branch: "main".to_string(),
+                    status_summary: ProjectStatusSummary::default(),
                     root_name: "nerve_center".to_string(),
                     root_cwd: "/home/test/repos/nerve_center".to_string(),
                     kind: ProjectKind::Root,
@@ -1918,14 +2068,46 @@ exit 1
                     name: "nerve_center.codex-hooks".to_string(),
                     cwd: "/home/test/repos/nerve_center.codex-hooks".to_string(),
                     branch: "codex-hooks".to_string(),
+                    status_summary: ProjectStatusSummary::default(),
                     root_name: "nerve_center".to_string(),
                     root_cwd: "/home/test/repos/nerve_center".to_string(),
                     kind: ProjectKind::Worktree,
                 },
             ]
         );
-        assert_eq!(projects[1].tree_label(), "nerve_center");
-        assert_eq!(projects[2].tree_label(), "  |- codex-hooks");
+        assert_eq!(projects[1].name, "nerve_center");
+        assert_eq!(projects[2].branch, "codex-hooks");
+    }
+
+    #[test]
+    fn parses_ascii_project_status_summary_from_porcelain_v2() {
+        let status = parse_project_status_output(
+            "# branch.oid abcdef0123456789\n\
+# branch.head feature/test\n\
+# branch.upstream origin/feature/test\n\
+# branch.ab +2 -1\n\
+1 M. N... 100644 100644 100644 abcdef1 abcdef2 tracked.txt\n\
+1 .M N... 100644 100644 100644 abcdef1 abcdef2 dirty.txt\n\
+1 D. N... 100644 000000 000000 abcdef1 0000000 removed.txt\n\
+u UU N... 100644 100644 100644 100644 abcdef1 abcdef2 abcdef3 conflict.txt\n\
+? new.txt\n",
+        )
+        .expect("status should parse");
+
+        assert_eq!(status.branch, "feature/test");
+        assert_eq!(
+            status.status_summary,
+            ProjectStatusSummary {
+                staged: 2,
+                modified: 1,
+                deleted: 1,
+                untracked: 1,
+                conflicts: 1,
+                ahead: 2,
+                behind: 1,
+            }
+        );
+        assert_eq!(status.status_summary.display_text(), "S2 M1 D1 ?1 U1 ^2 v1");
     }
 
     #[test]
