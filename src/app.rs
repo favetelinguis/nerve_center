@@ -204,12 +204,12 @@ impl ProjectAgentMonitor {
 
 #[derive(Debug, Clone)]
 enum InputMode {
-    WorktreeBranch { branch: String },
     Command { tab: AppTab, command: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProjectCommand {
+    Add { branch: String },
     Remove,
     Merge { target: Option<String> },
     Pr { target: Option<String> },
@@ -354,13 +354,6 @@ impl App {
 
     pub fn input_line(&self) -> String {
         match self.input_mode.as_ref() {
-            Some(InputMode::WorktreeBranch { branch }) => {
-                let root_name = self
-                    .selected_project()
-                    .map(|project| project.root_name.as_str())
-                    .unwrap_or("-");
-                format!("Create worktree branch for {root_name}: {branch}")
-            }
             Some(InputMode::Command { tab, command }) => {
                 let scope = match tab {
                     AppTab::Projects => self
@@ -377,7 +370,7 @@ impl App {
             }
             None => match self.active_tab {
                 AppTab::Projects => {
-                    "Ctrl-W create worktree branch | : command on selected project".to_string()
+                    ": command on selected project, e.g. wt add <branch>".to_string()
                 }
                 AppTab::Panes => ": command on active tab".to_string(),
             },
@@ -414,10 +407,6 @@ impl App {
             }
             AppAction::ProjectMoveDown => {
                 self.project_move_down();
-                Ok(())
-            }
-            AppAction::StartCreateWorktreeInput => {
-                self.start_worktree_input();
                 Ok(())
             }
             AppAction::StartCommandInput => {
@@ -522,19 +511,6 @@ impl App {
         }
     }
 
-    fn start_worktree_input(&mut self) {
-        let Some(project) = self.selected_project() else {
-            self.record_error("No projects found");
-            return;
-        };
-        let root_name = project.root_name.clone();
-
-        self.input_mode = Some(InputMode::WorktreeBranch {
-            branch: String::new(),
-        });
-        self.set_status(format!("Create worktree branch for {root_name}"));
-    }
-
     fn start_command_input(&mut self) {
         self.input_mode = Some(InputMode::Command {
             tab: self.active_tab,
@@ -549,7 +525,6 @@ impl App {
         };
 
         match input_mode {
-            InputMode::WorktreeBranch { branch } => branch.push(c),
             InputMode::Command { command, .. } => command.push(c),
         }
         self.last_error = None;
@@ -561,9 +536,6 @@ impl App {
         };
 
         match input_mode {
-            InputMode::WorktreeBranch { branch } => {
-                branch.pop();
-            }
             InputMode::Command { command, .. } => {
                 command.pop();
             }
@@ -582,7 +554,6 @@ impl App {
         };
 
         match input_mode {
-            InputMode::WorktreeBranch { branch } => self.confirm_worktree_input(&branch),
             InputMode::Command { tab, command } => {
                 self.input_mode = None;
                 self.execute_command(tab, &command, wezterm)
@@ -590,7 +561,11 @@ impl App {
         }
     }
 
-    fn confirm_worktree_input(&mut self, branch: &str) -> Result<()> {
+    fn add_selected_worktree<W: WeztermClient>(
+        &mut self,
+        branch: &str,
+        wezterm: &mut W,
+    ) -> Result<()> {
         let Some(project) = self.selected_project() else {
             self.record_error("No projects found");
             return Ok(());
@@ -607,8 +582,7 @@ impl App {
 
         run_git_worktree_add(&root_cwd, &branch, &target_cwd)?;
 
-        self.input_mode = None;
-        self.reload_projects(Some(&target_cwd))?;
+        self.sync_tui(wezterm, Some(&target_cwd))?;
         let worktree_name = Path::new(&target_cwd)
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -641,18 +615,19 @@ impl App {
         wezterm: &mut W,
     ) -> Result<()> {
         match parse_project_command(command)? {
-            ProjectCommand::Remove => self.remove_selected_worktree(),
+            ProjectCommand::Add { branch } => self.add_selected_worktree(&branch, wezterm),
+            ProjectCommand::Remove => self.remove_selected_worktree(wezterm),
             ProjectCommand::Merge { target } => {
-                self.merge_selected_worktree(target.as_deref())?;
+                self.merge_selected_worktree(target.as_deref(), wezterm)?;
                 Ok(())
             }
             ProjectCommand::Pr { target } => {
-                self.create_pull_request_for_selected_worktree(target.as_deref())?;
+                self.create_pull_request_for_selected_worktree(target.as_deref(), wezterm)?;
                 Ok(())
             }
             ProjectCommand::Land { target } => {
-                self.merge_selected_worktree(target.as_deref())?;
-                self.remove_selected_worktree()
+                self.merge_selected_worktree(target.as_deref(), wezterm)?;
+                self.remove_selected_worktree(wezterm)
             }
             ProjectCommand::Agent { runtime } => {
                 self.open_project_tab(wezterm, runtime.spawn_command())?;
@@ -699,7 +674,11 @@ impl App {
             .unwrap_or_else(|| project.root_cwd.clone())
     }
 
-    fn merge_selected_worktree(&mut self, explicit_target: Option<&str>) -> Result<()> {
+    fn merge_selected_worktree<W: WeztermClient>(
+        &mut self,
+        explicit_target: Option<&str>,
+        wezterm: &mut W,
+    ) -> Result<()> {
         let project = self.selected_linked_worktree()?;
         let target = self.resolve_target_branch(&project, explicit_target)?;
         if target == project.branch {
@@ -715,14 +694,15 @@ impl App {
         fast_forward_target_from_remote(&merge_cwd, &target)?;
         fast_forward_merge_branch(&merge_cwd, &project.branch, &target)?;
 
-        self.reload_projects(Some(&project.cwd))?;
+        self.sync_tui(wezterm, Some(&project.cwd))?;
         self.set_status(format!("Merged {} into {}", project.branch, target));
         Ok(())
     }
 
-    fn create_pull_request_for_selected_worktree(
+    fn create_pull_request_for_selected_worktree<W: WeztermClient>(
         &mut self,
         explicit_target: Option<&str>,
+        wezterm: &mut W,
     ) -> Result<()> {
         let project = self.selected_linked_worktree()?;
         let target = self.resolve_target_branch(&project, explicit_target)?;
@@ -737,6 +717,7 @@ impl App {
         push_branch_to_remote(&project.cwd, &remote, &project.branch)?;
         let pr_url = ensure_pull_request(&project.cwd, &project.branch, &target)?;
 
+        self.sync_tui(wezterm, Some(&project.cwd))?;
         self.set_status(format!(
             "PR ready for {} -> {}: {}",
             project.branch, target, pr_url
@@ -744,7 +725,7 @@ impl App {
         Ok(())
     }
 
-    fn remove_selected_worktree(&mut self) -> Result<()> {
+    fn remove_selected_worktree<W: WeztermClient>(&mut self, wezterm: &mut W) -> Result<()> {
         let project = self.selected_linked_worktree().map_err(|error| {
             if error
                 .to_string()
@@ -764,7 +745,7 @@ impl App {
         run_git_worktree_remove(&project.root_cwd, &project.cwd)?;
         run_git_branch_delete(&project.root_cwd, &project.branch)?;
 
-        self.reload_projects(Some(&project.root_cwd))?;
+        self.sync_tui(wezterm, Some(&project.root_cwd))?;
         self.set_status(format!(
             "Removed worktree {} and branch {}",
             project.name, project.branch
@@ -828,7 +809,7 @@ impl App {
         command: SpawnCommand,
     ) -> Result<()> {
         let project = match self.selected_project() {
-            Some(project) => project,
+            Some(project) => project.clone(),
             None => {
                 self.record_error("No projects found");
                 return Ok(());
@@ -837,6 +818,7 @@ impl App {
 
         wezterm.spawn_new_tab(self.tui_pane_id, &project.cwd, &command)?;
         wezterm.activate_pane(self.tui_pane_id)?;
+        self.refresh(wezterm)?;
         self.set_status(format!(
             "Opened {} tab for {}",
             command.label(),
@@ -850,6 +832,15 @@ impl App {
         self.replace_rows(panes)?;
         self.last_error = None;
         Ok(())
+    }
+
+    fn sync_tui<W: WeztermClient>(
+        &mut self,
+        wezterm: &mut W,
+        selected_cwd: Option<&str>,
+    ) -> Result<()> {
+        self.reload_projects(selected_cwd)?;
+        self.refresh(wezterm)
     }
 
     fn reload_projects(&mut self, selected_cwd: Option<&str>) -> Result<()> {
@@ -1101,12 +1092,18 @@ fn inspect_git_project(path: &Path) -> Result<Option<GitProjectProbe>> {
         .context("git root did not have a final path component")?
         .to_string_lossy()
         .into_owned();
-    let name = cwd_path
+    let cwd_name = cwd_path
         .file_name()
         .context("project path did not have a final path component")?
         .to_string_lossy()
         .into_owned();
     let status = read_project_status(path)?;
+    let is_root = git_dir == common_dir;
+    let name = if is_root || matches!(status.branch.as_str(), "DETACHED" | "N/A") {
+        cwd_name
+    } else {
+        status.branch.clone()
+    };
 
     Ok(Some(GitProjectProbe {
         name,
@@ -1116,7 +1113,7 @@ fn inspect_git_project(path: &Path) -> Result<Option<GitProjectProbe>> {
         root_name,
         root_cwd: root_cwd.to_string_lossy().into_owned(),
         common_dir: common_dir.to_string_lossy().into_owned(),
-        is_root: git_dir == common_dir,
+        is_root,
     }))
 }
 
@@ -1405,42 +1402,65 @@ fn parse_project_command(command: &str) -> Result<ProjectCommand> {
     let Some(name) = parts.next() else {
         bail!("empty projects command")
     };
-    let target = parts.next().map(str::to_string);
-    let extra = parts.next();
 
     match name {
-        "remove" => {
-            if target.is_some() || extra.is_some() {
-                bail!("remove does not take a target branch")
-            }
-            Ok(ProjectCommand::Remove)
-        }
-        "merge" => {
-            if extra.is_some() {
-                bail!("too many arguments for projects command: {command}")
-            }
-            Ok(ProjectCommand::Merge { target })
-        }
-        "pr" => {
-            if extra.is_some() {
-                bail!("too many arguments for projects command: {command}")
-            }
-            Ok(ProjectCommand::Pr { target })
-        }
-        "land" => {
-            if extra.is_some() {
-                bail!("too many arguments for projects command: {command}")
-            }
-            Ok(ProjectCommand::Land { target })
-        }
         "agent" => {
-            let runtime = target.ok_or_else(|| anyhow!("agent requires a runtime"))?;
-            if extra.is_some() {
+            let runtime = parts
+                .next()
+                .ok_or_else(|| anyhow!("agent requires a runtime"))?;
+            if parts.next().is_some() {
                 bail!("too many arguments for projects command: {command}")
             }
             Ok(ProjectCommand::Agent {
-                runtime: AgentRuntime::parse_command(&runtime)?,
+                runtime: AgentRuntime::parse_command(runtime)?,
             })
+        }
+        "wt" => {
+            let Some(subcommand) = parts.next() else {
+                bail!("wt requires a subcommand")
+            };
+
+            match subcommand {
+                "add" => {
+                    let branch = parts
+                        .next()
+                        .ok_or_else(|| anyhow!("wt add requires a branch name"))?;
+                    if parts.next().is_some() {
+                        bail!("too many arguments for projects command: {command}")
+                    }
+                    Ok(ProjectCommand::Add {
+                        branch: branch.to_string(),
+                    })
+                }
+                "remove" => {
+                    if parts.next().is_some() {
+                        bail!("wt remove does not take a target branch")
+                    }
+                    Ok(ProjectCommand::Remove)
+                }
+                "merge" => {
+                    let target = parts.next().map(str::to_string);
+                    if parts.next().is_some() {
+                        bail!("too many arguments for projects command: {command}")
+                    }
+                    Ok(ProjectCommand::Merge { target })
+                }
+                "pr" => {
+                    let target = parts.next().map(str::to_string);
+                    if parts.next().is_some() {
+                        bail!("too many arguments for projects command: {command}")
+                    }
+                    Ok(ProjectCommand::Pr { target })
+                }
+                "land" => {
+                    let target = parts.next().map(str::to_string);
+                    if parts.next().is_some() {
+                        bail!("too many arguments for projects command: {command}")
+                    }
+                    Ok(ProjectCommand::Land { target })
+                }
+                _ => bail!("unknown worktree command: {command}"),
+            }
         }
         _ => bail!("unknown projects command: {command}"),
     }
@@ -2113,25 +2133,12 @@ mod tests {
     }
 
     #[test]
-    fn starting_input_modes_sets_input_state() {
+    fn starting_command_input_sets_input_state() {
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
         let mut app =
             App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
 
-        app.apply(AppAction::StartCreateWorktreeInput, &mut wezterm)
-            .expect("worktree input should start");
-        app.apply(AppAction::EditInput('x'), &mut wezterm)
-            .expect("input should accept text");
-
-        assert!(app.is_input_active());
-        assert!(
-            app.input_line()
-                .contains("Create worktree branch for alpha: x")
-        );
-
-        app.apply(AppAction::CancelInput, &mut wezterm)
-            .expect("input should cancel");
         app.apply(AppAction::StartCommandInput, &mut wezterm)
             .expect("command input should start");
         app.apply(AppAction::EditInput('r'), &mut wezterm)
@@ -2150,7 +2157,7 @@ mod tests {
 
         app.apply(AppAction::StartCommandInput, &mut wezterm)
             .expect("command input should start");
-        for c in "remove".chars() {
+        for c in "wt remove".chars() {
             app.apply(AppAction::EditInput(c), &mut wezterm)
                 .expect("input should accept text");
         }
@@ -2168,24 +2175,34 @@ mod tests {
     #[test]
     fn parses_projects_commands_with_optional_target() {
         assert_eq!(
-            parse_project_command("merge").expect("merge should parse"),
+            parse_project_command("wt add feature/BOOST-3432").expect("wt add should parse"),
+            super::ProjectCommand::Add {
+                branch: "feature/BOOST-3432".to_string()
+            }
+        );
+        assert_eq!(
+            parse_project_command("wt merge").expect("wt merge should parse"),
             super::ProjectCommand::Merge { target: None }
         );
         assert_eq!(
-            parse_project_command("merge main").expect("merge target should parse"),
+            parse_project_command("wt merge main").expect("wt merge target should parse"),
             super::ProjectCommand::Merge {
                 target: Some("main".to_string())
             }
         );
         assert_eq!(
-            parse_project_command("pr main").expect("pr target should parse"),
+            parse_project_command("wt pr main").expect("wt pr target should parse"),
             super::ProjectCommand::Pr {
                 target: Some("main".to_string())
             }
         );
         assert_eq!(
-            parse_project_command("land").expect("land should parse"),
+            parse_project_command("wt land").expect("wt land should parse"),
             super::ProjectCommand::Land { target: None }
+        );
+        assert_eq!(
+            parse_project_command("wt remove").expect("wt remove should parse"),
+            super::ProjectCommand::Remove
         );
         assert_eq!(
             parse_project_command("agent claude").expect("agent should parse"),
@@ -2193,7 +2210,12 @@ mod tests {
                 runtime: super::AgentRuntime::Claude,
             }
         );
-        assert!(parse_project_command("remove main").is_err());
+        assert!(parse_project_command("remove").is_err());
+        assert!(parse_project_command("merge").is_err());
+        assert!(parse_project_command("pr main").is_err());
+        assert!(parse_project_command("land").is_err());
+        assert!(parse_project_command("wt add").is_err());
+        assert!(parse_project_command("wt remove main").is_err());
     }
 
     #[test]
@@ -2206,7 +2228,7 @@ mod tests {
         app.apply(AppAction::ProjectMoveDown, &mut wezterm)
             .expect("selection should move to worktree");
 
-        app.execute_project_command("merge", &mut wezterm)
+        app.execute_project_command("wt merge", &mut wezterm)
             .expect("merge should succeed");
 
         assert_eq!(head_message(&fixture.root), "feature change");
@@ -2218,7 +2240,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_w_preserves_branch_names_with_slashes_and_generates_wt_directory() {
+    fn wt_add_preserves_branch_names_with_slashes_and_generates_wt_directory() {
         let sandbox = test_sandbox("create-worktree-raw-branch");
         let root = sandbox.join("repo");
 
@@ -2236,23 +2258,17 @@ mod tests {
         let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
         let mut app = App::load_with_projects(&mut wezterm, projects).expect("app should load");
 
-        app.apply(AppAction::StartCreateWorktreeInput, &mut wezterm)
-            .expect("worktree input should start");
-        for c in "feature/BOOST-3432".chars() {
-            app.apply(AppAction::EditInput(c), &mut wezterm)
-                .expect("input should accept branch text");
-        }
-        app.apply(AppAction::ConfirmInput, &mut wezterm)
+        app.execute_project_command("wt add feature/BOOST-3432", &mut wezterm)
             .expect("worktree creation should succeed");
 
         let created = &app.projects()[app.selected_project_index()];
         assert_eq!(created.branch, "feature/BOOST-3432");
+        assert_eq!(created.name, "feature/BOOST-3432");
         assert!(
             created
                 .cwd
                 .starts_with(&format!("{}/wt-", sandbox.display()))
         );
-        assert!(created.name.starts_with("wt-"));
     }
 
     #[test]
@@ -2332,13 +2348,7 @@ mod tests {
 
         app.apply(AppAction::ProjectMoveDown, &mut wezterm)
             .expect("selection should move to the second project");
-        app.apply(AppAction::StartCreateWorktreeInput, &mut wezterm)
-            .expect("worktree input should start");
-        for c in "feature".chars() {
-            app.apply(AppAction::EditInput(c), &mut wezterm)
-                .expect("input should accept branch text");
-        }
-        app.apply(AppAction::ConfirmInput, &mut wezterm)
+        app.execute_project_command("wt add feature", &mut wezterm)
             .expect("worktree creation should succeed");
 
         let created = &app.projects()[app.selected_project_index()];
@@ -2346,6 +2356,29 @@ mod tests {
         assert!(created.cwd.starts_with(&format!("{}/wt-", right.display())));
         assert!(!created.cwd.starts_with(&format!("{}/wt-", left.display())));
         assert_eq!(app.projects()[0].root_cwd, root_as_str(&left_repo));
+    }
+
+    #[test]
+    fn remove_command_refreshes_tui_state() {
+        let fixture = create_worktree_fixture("remove-command-refresh");
+        git(&fixture.root, &["merge", "--ff-only", "feature"]);
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app = App::load_with_projects(&mut wezterm, fixture.projects.clone())
+            .expect("app should load");
+        app.apply(AppAction::ProjectMoveDown, &mut wezterm)
+            .expect("selection should move to worktree");
+
+        app.execute_project_command("wt remove", &mut wezterm)
+            .expect("remove should succeed");
+
+        assert!(!fixture.worktree.exists());
+        assert!(!branch_exists(&fixture.root, "feature"));
+        assert_eq!(app.projects().len(), 1);
+        assert_eq!(app.projects()[0].cwd, root_as_str(&fixture.root));
+        assert_eq!(app.selected_project_index(), 0);
+        assert!(app.status_line().contains("Removed worktree"));
+        assert_eq!(wezterm.calls, vec![Call::ListPanes, Call::ListPanes]);
     }
 
     #[test]
@@ -2358,7 +2391,7 @@ mod tests {
         app.apply(AppAction::ProjectMoveDown, &mut wezterm)
             .expect("selection should move to worktree");
 
-        app.execute_project_command("land", &mut wezterm)
+        app.execute_project_command("wt land", &mut wezterm)
             .expect("land should succeed");
 
         assert_eq!(head_message(&fixture.root), "feature change");
@@ -2406,7 +2439,7 @@ exit 1
         app.apply(AppAction::ProjectMoveDown, &mut wezterm)
             .expect("selection should move to worktree");
 
-        let result = app.execute_project_command("pr", &mut wezterm);
+        let result = app.execute_project_command("wt pr", &mut wezterm);
 
         unsafe {
             env::set_var("PATH", original_path);
@@ -2460,6 +2493,7 @@ exit 1
                     command: SpawnCommand::shell(),
                 },
                 Call::ActivatePane(10),
+                Call::ListPanes,
             ]
         );
     }
@@ -2484,6 +2518,7 @@ exit 1
                     command: SpawnCommand::new("claude", vec!["claude".to_string()]),
                 },
                 Call::ActivatePane(10),
+                Call::ListPanes,
             ]
         );
         assert!(app.status_line().contains("Opened claude tab for alpha"));
@@ -2513,12 +2548,14 @@ exit 1
                     command: SpawnCommand::nvim(),
                 },
                 Call::ActivatePane(10),
+                Call::ListPanes,
                 Call::SpawnNewTab {
                     pane_id: 10,
                     cwd: "/tmp/repos/beta".to_string(),
                     command: SpawnCommand::lazygit(),
                 },
                 Call::ActivatePane(10),
+                Call::ListPanes,
             ]
         );
     }
@@ -2565,7 +2602,7 @@ exit 1
     fn builds_project_tree_with_root_first_and_worktrees_nested() {
         let projects = build_project_entries(vec![
             GitProjectProbe {
-                name: "nerve_center.codex-hooks".to_string(),
+                name: "codex-hooks".to_string(),
                 cwd: "/home/test/repos/nerve_center.codex-hooks".to_string(),
                 branch: "codex-hooks".to_string(),
                 status_summary: ProjectStatusSummary::default(),
@@ -2618,7 +2655,7 @@ exit 1
                     kind: ProjectKind::Root,
                 },
                 ProjectEntry {
-                    name: "nerve_center.codex-hooks".to_string(),
+                    name: "codex-hooks".to_string(),
                     cwd: "/home/test/repos/nerve_center.codex-hooks".to_string(),
                     branch: "codex-hooks".to_string(),
                     status_summary: ProjectStatusSummary::default(),

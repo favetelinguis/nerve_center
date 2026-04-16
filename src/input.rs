@@ -10,7 +10,6 @@ pub enum AppAction {
     MoveDown,
     ProjectMoveUp,
     ProjectMoveDown,
-    StartCreateWorktreeInput,
     StartCommandInput,
     ConfirmInput,
     CancelInput,
@@ -80,7 +79,6 @@ fn project_mode_action(key: KeyEvent) -> Option<AppAction> {
             KeyCode::Char('t') => Some(AppAction::OpenProjectShell),
             KeyCode::Char('e') => Some(AppAction::OpenProjectEditor),
             KeyCode::Char('v') => Some(AppAction::OpenProjectGit),
-            KeyCode::Char('w') => Some(AppAction::StartCreateWorktreeInput),
             _ => None,
         },
         _ => None,
@@ -227,7 +225,7 @@ mod tests {
                 false,
                 KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL)
             ),
-            Some(AppAction::StartCreateWorktreeInput)
+            None
         );
     }
 
