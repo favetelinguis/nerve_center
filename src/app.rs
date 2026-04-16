@@ -6,6 +6,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::input::AppAction;
@@ -216,6 +217,13 @@ enum ProjectCommand {
     Agent { runtime: AgentRuntime },
 }
 
+const DEFAULT_REPO_SOURCE: &str = "~/repos";
+
+#[derive(Debug, Deserialize)]
+struct AppConfig {
+    repo_sources: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct App {
     rows: Vec<PaneRow>,
@@ -223,7 +231,7 @@ pub struct App {
     projects: Vec<ProjectEntry>,
     project_agent_monitors: Vec<Vec<ProjectAgentMonitor>>,
     selected_project_index: usize,
-    repos_root: String,
+    repo_sources: Vec<PathBuf>,
     active_tab: AppTab,
     mode: Mode,
     tui_pane_id: u64,
@@ -236,9 +244,9 @@ pub struct App {
 
 impl App {
     pub fn load<W: WeztermClient>(wezterm: &mut W) -> Result<Self> {
-        let repos_root = repos_root_from_env()?;
-        let projects = discover_projects_in(&repos_root)?;
-        Self::load_with_projects_in(wezterm, repos_root, projects)
+        let repo_sources = load_repo_sources_from_config()?;
+        let projects = discover_projects_in(&repo_sources)?;
+        Self::load_with_projects_in(wezterm, repo_sources, projects)
     }
 
     #[cfg(test)]
@@ -246,13 +254,13 @@ impl App {
         wezterm: &mut W,
         projects: Vec<ProjectEntry>,
     ) -> Result<Self> {
-        let repos_root = infer_repos_root(&projects).unwrap_or_else(|| "/tmp/repos".to_string());
-        Self::load_with_projects_in(wezterm, repos_root, projects)
+        let repo_sources = infer_repo_sources(&projects);
+        Self::load_with_projects_in(wezterm, repo_sources, projects)
     }
 
     fn load_with_projects_in<W: WeztermClient>(
         wezterm: &mut W,
-        repos_root: String,
+        repo_sources: Vec<PathBuf>,
         projects: Vec<ProjectEntry>,
     ) -> Result<Self> {
         let tui_pane_id = tui_pane_id_from_env()?;
@@ -264,7 +272,7 @@ impl App {
             projects: Vec::new(),
             project_agent_monitors: Vec::new(),
             selected_project_index: 0,
-            repos_root,
+            repo_sources,
             active_tab: AppTab::Projects,
             mode: Mode::Normal,
             tui_pane_id,
@@ -594,7 +602,8 @@ impl App {
         };
 
         let root_cwd = project.root_cwd.clone();
-        let target_cwd = generate_worktree_cwd(&self.repos_root)?;
+        let worktree_parent = worktree_parent_dir(project)?;
+        let target_cwd = generate_worktree_cwd(&worktree_parent)?;
 
         run_git_worktree_add(&root_cwd, &branch, &target_cwd)?;
 
@@ -844,7 +853,7 @@ impl App {
     }
 
     fn reload_projects(&mut self, selected_cwd: Option<&str>) -> Result<()> {
-        let projects = discover_projects_in(&self.repos_root)?;
+        let projects = discover_projects_in(&self.repo_sources)?;
         self.replace_projects(projects, selected_cwd);
         self.refresh_project_agent_monitors();
         Ok(())
@@ -896,38 +905,134 @@ impl App {
     }
 }
 
-fn repos_root_from_env() -> Result<String> {
-    let home = env::var("HOME").context("HOME is not set")?;
-    Ok(format!("{home}/repos"))
-}
-
 #[cfg(test)]
-fn infer_repos_root(projects: &[ProjectEntry]) -> Option<String> {
-    projects.first().and_then(|project| {
-        Path::new(&project.root_cwd)
-            .parent()
-            .map(|path| path.to_string_lossy().into_owned())
-    })
+fn infer_repo_sources(projects: &[ProjectEntry]) -> Vec<PathBuf> {
+    let mut repo_sources = BTreeMap::new();
+
+    for project in projects {
+        let Some(path) = Path::new(&project.root_cwd).parent() else {
+            continue;
+        };
+        repo_sources
+            .entry(path.to_string_lossy().into_owned())
+            .or_insert_with(|| path.to_path_buf());
+    }
+
+    repo_sources.into_values().collect()
 }
 
-fn discover_projects_in(repos_root: &str) -> Result<Vec<ProjectEntry>> {
-    let mut probes = Vec::new();
+fn discover_projects_in(repo_sources: &[PathBuf]) -> Result<Vec<ProjectEntry>> {
+    let mut probes = BTreeMap::new();
 
-    for entry in fs::read_dir(repos_root)
-        .with_context(|| format!("failed to read repos root {repos_root}"))?
-    {
-        let entry = entry.with_context(|| format!("failed to read entry in {repos_root}"))?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
+    for repo_source in repo_sources {
+        for entry in fs::read_dir(repo_source)
+            .with_context(|| format!("failed to read repo source {}", repo_source.display()))?
+        {
+            let entry = entry
+                .with_context(|| format!("failed to read entry in {}", repo_source.display()))?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
 
-        if let Some(probe) = inspect_git_project(&path)? {
-            probes.push(probe);
+            if let Some(probe) = inspect_git_project(&path)? {
+                probes.entry(probe.cwd.clone()).or_insert(probe);
+            }
         }
     }
 
-    Ok(build_project_entries(probes))
+    Ok(build_project_entries(probes.into_values().collect()))
+}
+
+fn home_dir_from_env() -> Result<PathBuf> {
+    let home = env::var("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home))
+}
+
+fn config_path_from_home(home: &Path) -> PathBuf {
+    home.join(".config/nerve_center/config.toml")
+}
+
+fn load_repo_sources_from_config() -> Result<Vec<PathBuf>> {
+    let home = home_dir_from_env()?;
+    let config_path = config_path_from_home(&home);
+    load_repo_sources_from_config_at(&config_path, &home)
+}
+
+fn load_repo_sources_from_config_at(config_path: &Path, home: &Path) -> Result<Vec<PathBuf>> {
+    ensure_repo_config_exists(config_path)?;
+
+    let content = fs::read_to_string(config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config: AppConfig = toml::from_str(&content)
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    normalize_repo_sources(&config.repo_sources, home)
+}
+
+fn ensure_repo_config_exists(config_path: &Path) -> Result<()> {
+    if config_path.exists() {
+        return Ok(());
+    }
+
+    let parent = config_path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent directory", config_path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    fs::write(config_path, default_repo_config())
+        .with_context(|| format!("failed to write {}", config_path.display()))?;
+    Ok(())
+}
+
+fn default_repo_config() -> String {
+    format!("repo_sources = [\"{}\"]\n", DEFAULT_REPO_SOURCE)
+}
+
+fn normalize_repo_sources(repo_sources: &[String], home: &Path) -> Result<Vec<PathBuf>> {
+    if repo_sources.is_empty() {
+        bail!("repo_sources must contain at least one directory")
+    }
+
+    let mut normalized = BTreeMap::new();
+    for repo_source in repo_sources {
+        let path = expand_home_path(repo_source, home);
+        if !path.exists() {
+            bail!("configured repo source does not exist: {}", path.display())
+        }
+        if !path.is_dir() {
+            bail!(
+                "configured repo source is not a directory: {}",
+                path.display()
+            )
+        }
+
+        let canonical = path
+            .canonicalize()
+            .with_context(|| format!("failed to resolve {}", path.display()))?;
+        normalized
+            .entry(canonical.to_string_lossy().into_owned())
+            .or_insert(canonical);
+    }
+
+    Ok(normalized.into_values().collect())
+}
+
+fn expand_home_path(path: &str, home: &Path) -> PathBuf {
+    if path == "~" {
+        return home.to_path_buf();
+    }
+
+    if let Some(rest) = path.strip_prefix("~/") {
+        return home.join(rest);
+    }
+
+    PathBuf::from(path)
+}
+
+fn worktree_parent_dir(project: &ProjectEntry) -> Result<PathBuf> {
+    Path::new(&project.root_cwd)
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow!("{} has no parent directory", project.root_cwd))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1600,7 +1705,7 @@ fn normalize_worktree_branch_input(input: &str) -> Option<String> {
     (!branch.is_empty()).then(|| branch.to_string())
 }
 
-fn generate_worktree_cwd(repos_root: &str) -> Result<String> {
+fn generate_worktree_cwd(parent_dir: &Path) -> Result<String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before unix epoch")?;
@@ -1617,9 +1722,9 @@ fn generate_worktree_cwd(repos_root: &str) -> Result<String> {
         } else {
             format!("{base}-{attempt}")
         };
-        let cwd = format!("{repos_root}/{name}");
-        if !Path::new(&cwd).exists() {
-            return Ok(cwd);
+        let cwd = parent_dir.join(&name);
+        if !cwd.exists() {
+            return Ok(cwd.to_string_lossy().into_owned());
         }
     }
 
@@ -2124,7 +2229,7 @@ mod tests {
         write_file(&root.join("tracked.txt"), "hello\n");
         git_commit_all(&root, "init");
 
-        let projects = super::discover_projects_in(root_as_str(&sandbox))
+        let projects = super::discover_projects_in(std::slice::from_ref(&sandbox))
             .expect("projects should be discovered");
 
         set_wezterm_pane();
@@ -2148,6 +2253,99 @@ mod tests {
                 .starts_with(&format!("{}/wt-", sandbox.display()))
         );
         assert!(created.name.starts_with("wt-"));
+    }
+
+    #[test]
+    fn bootstraps_default_repo_config_and_loads_default_source() {
+        let home = test_sandbox("config-bootstrap");
+        let repo_source = home.join("repos");
+        let config_path = super::config_path_from_home(&home);
+
+        fs::create_dir_all(&repo_source).expect("default repo source should be created");
+
+        let repo_sources = super::load_repo_sources_from_config_at(&config_path, &home)
+            .expect("default config should load");
+
+        assert_eq!(
+            repo_sources,
+            vec![repo_source.canonicalize().expect("path should resolve")]
+        );
+        assert_eq!(
+            fs::read_to_string(config_path).expect("config should be written"),
+            "repo_sources = [\"~/repos\"]\n"
+        );
+    }
+
+    #[test]
+    fn repo_config_rejects_missing_source() {
+        let home = test_sandbox("config-missing-source");
+        let config_path = super::config_path_from_home(&home);
+
+        fs::create_dir_all(
+            config_path
+                .parent()
+                .expect("config path should have a parent directory"),
+        )
+        .expect("config directory should be created");
+        write_file(&config_path, "repo_sources = [\"~/missing\"]\n");
+
+        let error = super::load_repo_sources_from_config_at(&config_path, &home)
+            .expect_err("missing repo source should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("configured repo source does not exist")
+        );
+    }
+
+    #[test]
+    fn discovers_projects_across_multiple_repo_sources() {
+        let left = test_sandbox("discover-multi-left");
+        let right = test_sandbox("discover-multi-right");
+
+        create_repo_in(&left, "alpha");
+        create_repo_in(&right, "beta");
+
+        let projects = super::discover_projects_in(&[left, right])
+            .expect("projects should be discovered across both sources");
+
+        let names = projects
+            .iter()
+            .filter(|project| project.kind == ProjectKind::Root)
+            .map(|project| project.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn worktree_creation_uses_selected_project_parent_directory() {
+        let left = test_sandbox("worktree-parent-left");
+        let right = test_sandbox("worktree-parent-right");
+        let left_repo = create_repo_in(&left, "alpha");
+        let right_repo = create_repo_in(&right, "zeta");
+        let projects = super::discover_projects_in(&[left.clone(), right.clone()])
+            .expect("projects should be discovered");
+
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app = App::load_with_projects(&mut wezterm, projects).expect("app should load");
+
+        app.apply(AppAction::ProjectMoveDown, &mut wezterm)
+            .expect("selection should move to the second project");
+        app.apply(AppAction::StartCreateWorktreeInput, &mut wezterm)
+            .expect("worktree input should start");
+        for c in "feature".chars() {
+            app.apply(AppAction::EditInput(c), &mut wezterm)
+                .expect("input should accept branch text");
+        }
+        app.apply(AppAction::ConfirmInput, &mut wezterm)
+            .expect("worktree creation should succeed");
+
+        let created = &app.projects()[app.selected_project_index()];
+        assert_eq!(created.root_cwd, root_as_str(&right_repo));
+        assert!(created.cwd.starts_with(&format!("{}/wt-", right.display())));
+        assert!(!created.cwd.starts_with(&format!("{}/wt-", left.display())));
+        assert_eq!(app.projects()[0].root_cwd, root_as_str(&left_repo));
     }
 
     #[test]
@@ -2554,7 +2752,7 @@ u UU N... 100644 100644 100644 100644 abcdef1 abcdef2 abcdef3 conflict.txt\n\
         git_commit_all(&worktree, "feature change");
         git(&sandbox, &["init", "--bare", root_as_str(&remote)]);
 
-        let projects = super::discover_projects_in(root_as_str(&sandbox))
+        let projects = super::discover_projects_in(std::slice::from_ref(&sandbox))
             .expect("projects should be discovered");
         WorktreeFixture {
             root,
@@ -2562,6 +2760,17 @@ u UU N... 100644 100644 100644 100644 abcdef1 abcdef2 abcdef3 conflict.txt\n\
             remote,
             projects,
         }
+    }
+
+    fn create_repo_in(parent: &Path, name: &str) -> PathBuf {
+        let root = parent.join(name);
+        git(
+            parent,
+            &["init", "--initial-branch=main", root_as_str(&root)],
+        );
+        write_file(&root.join("tracked.txt"), "hello\n");
+        git_commit_all(&root, "init");
+        root
     }
 
     fn test_sandbox(name: &str) -> PathBuf {

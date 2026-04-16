@@ -2,6 +2,16 @@
 
 `nerve_center` shows a list of projects and panes in a terminal UI.
 
+## Config
+
+On first start, `nerve_center` creates `~/.config/nerve_center/config.toml` with:
+
+```toml
+repo_sources = ["~/repos"]
+```
+
+`repo_sources` is the list of directories scanned for the `Projects` tab. Every configured path must exist and be a directory or startup will fail with an error naming the invalid path.
+
 ## Releases
 
 Release artifacts are built with `cargo-dist` by GitHub Actions when you push a
