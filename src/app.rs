@@ -5,14 +5,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::input::AppAction;
 use crate::wezterm::{
-    PaneInfo, SpawnCommand, SplitDirection, TuiTabLayout, WeztermClient, find_pane, listable_panes,
-    tui_pane_id_from_env, tui_tab_layout,
+    find_pane, listable_panes, tui_pane_id_from_env, tui_tab_layout, PaneInfo, SpawnCommand,
+    SplitDirection, TuiTabLayout, WeztermClient,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -288,6 +288,10 @@ impl App {
 
     pub fn selected_project_index(&self) -> usize {
         self.selected_project_index
+    }
+
+    pub fn selected_project_cwd(&self) -> Option<&str> {
+        self.selected_project().map(|project| project.cwd.as_str())
     }
 
     pub fn is_input_active(&self) -> bool {
@@ -1823,9 +1827,9 @@ mod tests {
     use anyhow::Result;
 
     use super::{
-        App, GitProjectProbe, Mode, ProjectEntry, ProjectKind, ProjectStatusSummary,
         build_project_entries, parse_project_command, parse_project_status_output,
-        run_git_branch_delete, run_git_worktree_remove,
+        run_git_branch_delete, run_git_worktree_remove, App, GitProjectProbe, Mode, ProjectEntry,
+        ProjectKind, ProjectStatusSummary,
     };
     use crate::input::AppAction;
     use crate::wezterm::{PaneInfo, SpawnCommand, SplitDirection, WeztermClient};
@@ -2124,11 +2128,9 @@ mod tests {
         let error = app
             .apply(AppAction::ConfirmInput, &mut wezterm)
             .expect_err("root remove should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("remove only works on linked worktrees")
-        );
+        assert!(error
+            .to_string()
+            .contains("remove only works on linked worktrees"));
     }
 
     #[test]
@@ -2223,11 +2225,9 @@ mod tests {
         let created = &app.projects()[app.selected_project_index()];
         assert_eq!(created.branch, "feature/BOOST-3432");
         assert_eq!(created.name, "feature/BOOST-3432");
-        assert!(
-            created
-                .cwd
-                .starts_with(&format!("{}/wt-", sandbox.display()))
-        );
+        assert!(created
+            .cwd
+            .starts_with(&format!("{}/wt-", sandbox.display())));
     }
 
     #[test]
@@ -2266,11 +2266,9 @@ mod tests {
 
         let error = super::load_repo_sources_from_config_at(&config_path, &home)
             .expect_err("missing repo source should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("configured repo source does not exist")
-        );
+        assert!(error
+            .to_string()
+            .contains("configured repo source does not exist"));
     }
 
     #[test]
@@ -2407,10 +2405,9 @@ exit 1
         result.expect("pr should succeed");
 
         assert!(remote_branch_exists(&fixture.remote, "feature"));
-        assert!(
-            app.status_line()
-                .contains("PR ready for feature -> main: https://example.com/pr/123")
-        );
+        assert!(app
+            .status_line()
+            .contains("PR ready for feature -> main: https://example.com/pr/123"));
     }
 
     #[test]
@@ -2423,10 +2420,9 @@ exit 1
         app.apply(AppAction::AttachProjectAgent, &mut wezterm)
             .expect("attach should not error");
 
-        assert!(
-            app.status_line()
-                .contains("Start an agent for this project first")
-        );
+        assert!(app
+            .status_line()
+            .contains("Start an agent for this project first"));
         assert_eq!(wezterm.calls, vec![Call::ListPanes]);
     }
 
@@ -2983,11 +2979,9 @@ u UU N... 100644 100644 100644 100644 abcdef1 abcdef2 abcdef3 conflict.txt\n\
 
         let remove_error = run_git_worktree_remove(root_as_str(&root), root_as_str(&worktree))
             .expect_err("dirty worktree removal should fail");
-        assert!(
-            remove_error
-                .to_string()
-                .contains("git worktree remove failed")
-        );
+        assert!(remove_error
+            .to_string()
+            .contains("git worktree remove failed"));
 
         run_git_branch_delete(root_as_str(&root), "review")
             .expect_err("branch should still be checked out in dirty worktree");
