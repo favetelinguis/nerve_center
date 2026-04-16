@@ -6,11 +6,12 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
+use serde_json::Value;
 
 use crate::input::AppAction;
 use crate::wezterm::{
-    NewTabCommand, PaneInfo, SplitDirection, TuiTabLayout, WeztermClient, find_pane,
-    listable_panes, tui_pane_id_from_env, tui_tab_layout,
+    PaneInfo, SpawnCommand, SplitDirection, TuiTabLayout, WeztermClient, find_pane, listable_panes,
+    tui_pane_id_from_env, tui_tab_layout,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -109,6 +110,97 @@ impl PaneRow {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentRuntime {
+    Claude,
+    OpenCode,
+}
+
+impl AgentRuntime {
+    fn parse_command(name: &str) -> Result<Self> {
+        match name {
+            "claude" | "claude-code" => Ok(Self::Claude),
+            "opencode" => Ok(Self::OpenCode),
+            _ => bail!("unknown agent runtime: {name}"),
+        }
+    }
+
+    fn from_state_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "claude" | "claude-code" | "cc" => Some(Self::Claude),
+            "opencode" | "oc" => Some(Self::OpenCode),
+            _ => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::OpenCode => "opencode",
+        }
+    }
+
+    fn short_label(self) -> &'static str {
+        match self {
+            Self::Claude => "cc",
+            Self::OpenCode => "oc",
+        }
+    }
+
+    fn spawn_command(self) -> SpawnCommand {
+        SpawnCommand::new(self.label(), vec![self.label().to_string()])
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentMonitorState {
+    Working,
+    NeedsInput,
+    Done,
+    Error,
+}
+
+impl AgentMonitorState {
+    fn from_state_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "working" | "busy" | "running" | "retry" => Some(Self::Working),
+            "needs_input" | "needs-input" | "input" | "awaiting_user" | "awaiting-user" => {
+                Some(Self::NeedsInput)
+            }
+            "done" | "idle" | "complete" | "completed" => Some(Self::Done),
+            "error" | "failed" => Some(Self::Error),
+            _ => None,
+        }
+    }
+
+    fn short_code(self) -> char {
+        match self {
+            Self::Working => 'w',
+            Self::NeedsInput => 'i',
+            Self::Done => 'd',
+            Self::Error => 'e',
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectAgentMonitor {
+    pane_id: u64,
+    runtime: AgentRuntime,
+    state: AgentMonitorState,
+}
+
+impl ProjectAgentMonitor {
+    pub fn display_text(&self) -> String {
+        format!(
+            "{}:{}[{}]",
+            self.runtime.short_label(),
+            self.pane_id,
+            self.state.short_code()
+        )
+    }
+}
+
 #[derive(Debug, Clone)]
 enum InputMode {
     WorktreeBranch { branch: String },
@@ -121,6 +213,7 @@ enum ProjectCommand {
     Merge { target: Option<String> },
     Pr { target: Option<String> },
     Land { target: Option<String> },
+    Agent { runtime: AgentRuntime },
 }
 
 #[derive(Debug)]
@@ -128,6 +221,7 @@ pub struct App {
     rows: Vec<PaneRow>,
     selected_index: usize,
     projects: Vec<ProjectEntry>,
+    project_agent_monitors: Vec<Vec<ProjectAgentMonitor>>,
     selected_project_index: usize,
     repos_root: String,
     active_tab: AppTab,
@@ -168,6 +262,7 @@ impl App {
             rows: Vec::new(),
             selected_index: 0,
             projects: Vec::new(),
+            project_agent_monitors: Vec::new(),
             selected_project_index: 0,
             repos_root,
             active_tab: AppTab::Projects,
@@ -201,6 +296,13 @@ impl App {
         &self.projects
     }
 
+    pub fn project_agent_monitors(&self, project_index: usize) -> &[ProjectAgentMonitor] {
+        self.project_agent_monitors
+            .get(project_index)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     pub fn selected_project_index(&self) -> usize {
         self.selected_project_index
     }
@@ -223,6 +325,10 @@ impl App {
 
     pub fn should_quit(&self) -> bool {
         self.should_quit
+    }
+
+    pub fn tick<W: WeztermClient>(&mut self, wezterm: &mut W) -> Result<()> {
+        self.refresh(wezterm)
     }
 
     pub fn status_line(&self) -> String {
@@ -310,7 +416,7 @@ impl App {
                 self.start_command_input();
                 Ok(())
             }
-            AppAction::ConfirmInput => self.confirm_input(),
+            AppAction::ConfirmInput => self.confirm_input(wezterm),
             AppAction::CancelInput => {
                 self.cancel_input();
                 Ok(())
@@ -324,9 +430,9 @@ impl App {
                 Ok(())
             }
             AppAction::AttachSelected => self.attach_selected(wezterm),
-            AppAction::OpenProjectShell => self.open_project_tab(wezterm, NewTabCommand::Shell),
-            AppAction::OpenProjectEditor => self.open_project_tab(wezterm, NewTabCommand::Nvim),
-            AppAction::OpenProjectGit => self.open_project_tab(wezterm, NewTabCommand::Lazygit),
+            AppAction::OpenProjectShell => self.open_project_tab(wezterm, SpawnCommand::shell()),
+            AppAction::OpenProjectEditor => self.open_project_tab(wezterm, SpawnCommand::nvim()),
+            AppAction::OpenProjectGit => self.open_project_tab(wezterm, SpawnCommand::lazygit()),
             AppAction::Quit => {
                 self.should_quit = true;
                 self.set_status("Quit");
@@ -368,6 +474,7 @@ impl App {
             self.mode = Mode::Normal;
         }
 
+        self.refresh_project_agent_monitors();
         Ok(())
     }
 
@@ -461,7 +568,7 @@ impl App {
         self.set_status("Cancelled input");
     }
 
-    fn confirm_input(&mut self) -> Result<()> {
+    fn confirm_input<W: WeztermClient>(&mut self, wezterm: &mut W) -> Result<()> {
         let Some(input_mode) = self.input_mode.clone() else {
             return Ok(());
         };
@@ -470,7 +577,7 @@ impl App {
             InputMode::WorktreeBranch { branch } => self.confirm_worktree_input(&branch),
             InputMode::Command { tab, command } => {
                 self.input_mode = None;
-                self.execute_command(tab, &command)
+                self.execute_command(tab, &command, wezterm)
             }
         }
     }
@@ -501,7 +608,12 @@ impl App {
         Ok(())
     }
 
-    fn execute_command(&mut self, tab: AppTab, command: &str) -> Result<()> {
+    fn execute_command<W: WeztermClient>(
+        &mut self,
+        tab: AppTab,
+        command: &str,
+        wezterm: &mut W,
+    ) -> Result<()> {
         let command = command.trim();
         if command.is_empty() {
             self.set_status("Cancelled command");
@@ -509,12 +621,16 @@ impl App {
         }
 
         match tab {
-            AppTab::Projects => self.execute_project_command(command),
+            AppTab::Projects => self.execute_project_command(command, wezterm),
             AppTab::Panes => bail!("no commands are implemented for the panes tab"),
         }
     }
 
-    fn execute_project_command(&mut self, command: &str) -> Result<()> {
+    fn execute_project_command<W: WeztermClient>(
+        &mut self,
+        command: &str,
+        wezterm: &mut W,
+    ) -> Result<()> {
         match parse_project_command(command)? {
             ProjectCommand::Remove => self.remove_selected_worktree(),
             ProjectCommand::Merge { target } => {
@@ -528,6 +644,10 @@ impl App {
             ProjectCommand::Land { target } => {
                 self.merge_selected_worktree(target.as_deref())?;
                 self.remove_selected_worktree()
+            }
+            ProjectCommand::Agent { runtime } => {
+                self.open_project_tab(wezterm, runtime.spawn_command())?;
+                Ok(())
             }
         }
     }
@@ -696,7 +816,7 @@ impl App {
     fn open_project_tab<W: WeztermClient>(
         &mut self,
         wezterm: &mut W,
-        command: NewTabCommand,
+        command: SpawnCommand,
     ) -> Result<()> {
         let project = match self.selected_project() {
             Some(project) => project,
@@ -706,7 +826,7 @@ impl App {
             }
         };
 
-        wezterm.spawn_new_tab(self.tui_pane_id, &project.cwd, command)?;
+        wezterm.spawn_new_tab(self.tui_pane_id, &project.cwd, &command)?;
         wezterm.activate_pane(self.tui_pane_id)?;
         self.set_status(format!(
             "Opened {} tab for {}",
@@ -726,6 +846,7 @@ impl App {
     fn reload_projects(&mut self, selected_cwd: Option<&str>) -> Result<()> {
         let projects = discover_projects_in(&self.repos_root)?;
         self.replace_projects(projects, selected_cwd);
+        self.refresh_project_agent_monitors();
         Ok(())
     }
 
@@ -742,6 +863,31 @@ impl App {
         if self.selected_project_index >= self.projects.len() {
             self.selected_project_index = self.projects.len().saturating_sub(1);
         }
+
+        self.project_agent_monitors = vec![Vec::new(); self.projects.len()];
+    }
+
+    fn refresh_project_agent_monitors(&mut self) {
+        let mut monitors = vec![Vec::new(); self.projects.len()];
+        let pane_monitors = load_pane_agent_monitors(&self.rows);
+
+        for (pane_cwd, monitor) in pane_monitors {
+            if let Some(project_index) = project_index_for_cwd(&self.projects, &pane_cwd) {
+                monitors[project_index].push(monitor);
+            }
+        }
+
+        for project_monitors in &mut monitors {
+            project_monitors.sort_by_key(|monitor| {
+                (
+                    monitor.runtime.short_label().to_string(),
+                    monitor.pane_id,
+                    monitor.state.short_code(),
+                )
+            });
+        }
+
+        self.project_agent_monitors = monitors;
     }
 
     fn set_status(&mut self, status: impl Into<String>) {
@@ -1037,26 +1183,160 @@ fn build_project_entries(probes: Vec<GitProjectProbe>) -> Vec<ProjectEntry> {
     projects
 }
 
+fn agent_state_dir_from_env() -> Result<PathBuf> {
+    if let Ok(path) = env::var("NERVE_CENTER_DATA_DIR") {
+        return Ok(PathBuf::from(path));
+    }
+
+    let home = env::var("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".local/data/nerve_center"))
+}
+
+fn load_pane_agent_monitors(rows: &[PaneRow]) -> Vec<(String, ProjectAgentMonitor)> {
+    let Ok(agent_state_dir) = agent_state_dir_from_env() else {
+        return Vec::new();
+    };
+    let Ok(entries) = fs::read_dir(agent_state_dir) else {
+        return Vec::new();
+    };
+
+    let pane_cwds = rows
+        .iter()
+        .filter_map(|row| normalize_pane_cwd(&row.pane.cwd).map(|cwd| (row.pane.pane_id, cwd)))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut monitors = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Ok(pane_id) = file_name.parse::<u64>() else {
+            continue;
+        };
+        let Some(pane_cwd) = pane_cwds.get(&pane_id) else {
+            continue;
+        };
+        let Some(monitor) = read_pane_agent_monitor(&path, pane_id) else {
+            continue;
+        };
+
+        monitors.push((pane_cwd.clone(), monitor));
+    }
+
+    monitors
+}
+
+fn read_pane_agent_monitor(path: &Path, pane_id: u64) -> Option<ProjectAgentMonitor> {
+    let content = fs::read_to_string(path).ok()?;
+    let json: Value = serde_json::from_str(&content).ok()?;
+    let runtime = json
+        .get("runtime")
+        .and_then(Value::as_str)
+        .or_else(|| json.get("source").and_then(Value::as_str))
+        .and_then(AgentRuntime::from_state_name)?;
+    let state = infer_agent_monitor_state(&json)?;
+
+    Some(ProjectAgentMonitor {
+        pane_id,
+        runtime,
+        state,
+    })
+}
+
+fn infer_agent_monitor_state(json: &Value) -> Option<AgentMonitorState> {
+    if json
+        .get("awaiting_user")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Some(AgentMonitorState::NeedsInput);
+    }
+
+    json.get("effective_state")
+        .and_then(Value::as_str)
+        .and_then(AgentMonitorState::from_state_name)
+        .or_else(|| {
+            json.get("state")
+                .and_then(Value::as_str)
+                .and_then(AgentMonitorState::from_state_name)
+        })
+        .or_else(|| {
+            json.get("main")
+                .and_then(|main| main.get("state"))
+                .and_then(Value::as_str)
+                .and_then(AgentMonitorState::from_state_name)
+        })
+}
+
+fn normalize_pane_cwd(cwd: &str) -> Option<String> {
+    let cwd = cwd.strip_prefix("file://").unwrap_or(cwd);
+    (!cwd.is_empty()).then(|| cwd.trim_end_matches('/').to_string())
+}
+
+fn project_index_for_cwd(projects: &[ProjectEntry], cwd: &str) -> Option<usize> {
+    projects
+        .iter()
+        .enumerate()
+        .filter_map(|(index, project)| {
+            let project_cwd = project.cwd.trim_end_matches('/');
+            if cwd == project_cwd {
+                return Some((index, project_cwd.len()));
+            }
+
+            cwd.strip_prefix(project_cwd)
+                .filter(|suffix| suffix.starts_with('/'))
+                .map(|_| (index, project_cwd.len()))
+        })
+        .max_by_key(|(_, match_len)| *match_len)
+        .map(|(index, _)| index)
+}
+
 fn parse_project_command(command: &str) -> Result<ProjectCommand> {
     let mut parts = command.split_whitespace();
     let Some(name) = parts.next() else {
         bail!("empty projects command")
     };
     let target = parts.next().map(str::to_string);
-    if parts.next().is_some() {
-        bail!("too many arguments for projects command: {command}")
-    }
+    let extra = parts.next();
 
     match name {
         "remove" => {
-            if target.is_some() {
+            if target.is_some() || extra.is_some() {
                 bail!("remove does not take a target branch")
             }
             Ok(ProjectCommand::Remove)
         }
-        "merge" => Ok(ProjectCommand::Merge { target }),
-        "pr" => Ok(ProjectCommand::Pr { target }),
-        "land" => Ok(ProjectCommand::Land { target }),
+        "merge" => {
+            if extra.is_some() {
+                bail!("too many arguments for projects command: {command}")
+            }
+            Ok(ProjectCommand::Merge { target })
+        }
+        "pr" => {
+            if extra.is_some() {
+                bail!("too many arguments for projects command: {command}")
+            }
+            Ok(ProjectCommand::Pr { target })
+        }
+        "land" => {
+            if extra.is_some() {
+                bail!("too many arguments for projects command: {command}")
+            }
+            Ok(ProjectCommand::Land { target })
+        }
+        "agent" => {
+            let runtime = target.ok_or_else(|| anyhow!("agent requires a runtime"))?;
+            if extra.is_some() {
+                bail!("too many arguments for projects command: {command}")
+            }
+            Ok(ProjectCommand::Agent {
+                runtime: AgentRuntime::parse_command(&runtime)?,
+            })
+        }
         _ => bail!("unknown projects command: {command}"),
     }
 }
@@ -1405,7 +1685,7 @@ mod tests {
         run_git_branch_delete, run_git_worktree_remove,
     };
     use crate::input::AppAction;
-    use crate::wezterm::{NewTabCommand, PaneInfo, SplitDirection, WeztermClient};
+    use crate::wezterm::{PaneInfo, SpawnCommand, SplitDirection, WeztermClient};
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Call {
@@ -1424,7 +1704,7 @@ mod tests {
         SpawnNewTab {
             pane_id: u64,
             cwd: String,
-            command: NewTabCommand,
+            command: SpawnCommand,
         },
     }
 
@@ -1492,11 +1772,11 @@ mod tests {
             Ok(())
         }
 
-        fn spawn_new_tab(&mut self, pane_id: u64, cwd: &str, command: NewTabCommand) -> Result<()> {
+        fn spawn_new_tab(&mut self, pane_id: u64, cwd: &str, command: &SpawnCommand) -> Result<()> {
             self.calls.push(Call::SpawnNewTab {
                 pane_id,
                 cwd: cwd.to_string(),
-                command,
+                command: command.clone(),
             });
             Ok(())
         }
@@ -1552,6 +1832,12 @@ mod tests {
             is_zoomed: false,
             tty_name: format!("/dev/pts/{pane_id}"),
         }
+    }
+
+    fn pane_with_cwd(pane_id: u64, tab_id: u64, window_id: u64, cwd: &str) -> PaneInfo {
+        let mut pane = pane(pane_id, tab_id, window_id);
+        pane.cwd = cwd.to_string();
+        pane
     }
 
     fn set_wezterm_pane() {
@@ -1796,6 +2082,12 @@ mod tests {
             parse_project_command("land").expect("land should parse"),
             super::ProjectCommand::Land { target: None }
         );
+        assert_eq!(
+            parse_project_command("agent claude").expect("agent should parse"),
+            super::ProjectCommand::Agent {
+                runtime: super::AgentRuntime::Claude,
+            }
+        );
         assert!(parse_project_command("remove main").is_err());
     }
 
@@ -1809,7 +2101,7 @@ mod tests {
         app.apply(AppAction::ProjectMoveDown, &mut wezterm)
             .expect("selection should move to worktree");
 
-        app.execute_project_command("merge")
+        app.execute_project_command("merge", &mut wezterm)
             .expect("merge should succeed");
 
         assert_eq!(head_message(&fixture.root), "feature change");
@@ -1868,7 +2160,7 @@ mod tests {
         app.apply(AppAction::ProjectMoveDown, &mut wezterm)
             .expect("selection should move to worktree");
 
-        app.execute_project_command("land")
+        app.execute_project_command("land", &mut wezterm)
             .expect("land should succeed");
 
         assert_eq!(head_message(&fixture.root), "feature change");
@@ -1916,7 +2208,7 @@ exit 1
         app.apply(AppAction::ProjectMoveDown, &mut wezterm)
             .expect("selection should move to worktree");
 
-        let result = app.execute_project_command("pr");
+        let result = app.execute_project_command("pr", &mut wezterm);
 
         unsafe {
             env::set_var("PATH", original_path);
@@ -1967,11 +2259,36 @@ exit 1
                 Call::SpawnNewTab {
                     pane_id: 10,
                     cwd: "/tmp/repos/alpha".to_string(),
-                    command: NewTabCommand::Shell,
+                    command: SpawnCommand::shell(),
                 },
                 Call::ActivatePane(10),
             ]
         );
+    }
+
+    #[test]
+    fn agent_command_spawns_agent_tab_and_refocuses_tui() {
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        app.execute_project_command("agent claude", &mut wezterm)
+            .expect("agent command should succeed");
+
+        assert_eq!(
+            wezterm.calls,
+            vec![
+                Call::ListPanes,
+                Call::SpawnNewTab {
+                    pane_id: 10,
+                    cwd: "/tmp/repos/alpha".to_string(),
+                    command: SpawnCommand::new("claude", vec!["claude".to_string()]),
+                },
+                Call::ActivatePane(10),
+            ]
+        );
+        assert!(app.status_line().contains("Opened claude tab for alpha"));
     }
 
     #[test]
@@ -1995,17 +2312,55 @@ exit 1
                 Call::SpawnNewTab {
                     pane_id: 10,
                     cwd: "/tmp/repos/beta".to_string(),
-                    command: NewTabCommand::Nvim,
+                    command: SpawnCommand::nvim(),
                 },
                 Call::ActivatePane(10),
                 Call::SpawnNewTab {
                     pane_id: 10,
                     cwd: "/tmp/repos/beta".to_string(),
-                    command: NewTabCommand::Lazygit,
+                    command: SpawnCommand::lazygit(),
                 },
                 Call::ActivatePane(10),
             ]
         );
+    }
+
+    #[test]
+    fn loads_multiple_agent_monitors_for_one_project() {
+        let state_dir = test_sandbox("agent-state-dir");
+        write_file(
+            &state_dir.join("20"),
+            r#"{"source":"claude","effective_state":"working"}"#,
+        );
+        write_file(
+            &state_dir.join("30"),
+            r#"{"runtime":"opencode","effective_state":"needs_input"}"#,
+        );
+
+        unsafe {
+            env::set_var("NERVE_CENTER_DATA_DIR", root_as_str(&state_dir));
+        }
+
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![
+            pane_with_cwd(10, 1, 1, "file:///tmp/repos/nerve_center"),
+            pane_with_cwd(20, 2, 1, "file:///tmp/repos/alpha/src"),
+            pane_with_cwd(30, 3, 1, "file:///tmp/repos/alpha"),
+        ]]);
+
+        let app = App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        unsafe {
+            env::remove_var("NERVE_CENTER_DATA_DIR");
+        }
+
+        let alpha_monitors = app
+            .project_agent_monitors(0)
+            .iter()
+            .map(|monitor| monitor.display_text())
+            .collect::<Vec<_>>();
+        assert_eq!(alpha_monitors, vec!["cc:20[w]", "oc:30[i]"]);
+        assert!(app.project_agent_monitors(1).is_empty());
     }
 
     #[test]

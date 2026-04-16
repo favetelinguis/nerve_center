@@ -35,6 +35,9 @@ fn run_loop<W: WeztermClient>(
         terminal.draw(|frame| ui::render(frame, app))?;
 
         if !event::poll(Duration::from_millis(250))? {
+            if let Err(error) = app.tick(wezterm) {
+                app.record_error(error.to_string());
+            }
             continue;
         }
 

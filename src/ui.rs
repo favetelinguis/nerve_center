@@ -68,17 +68,43 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             .map(|project| project.branch.len())
             .max()
             .unwrap_or(0);
+        let status_width = app
+            .projects()
+            .iter()
+            .map(|project| project.status_summary.display_text().len())
+            .max()
+            .unwrap_or(0);
+        let agents = app
+            .projects()
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                let monitors = app.project_agent_monitors(index);
+                if monitors.is_empty() {
+                    "-".to_string()
+                } else {
+                    monitors
+                        .iter()
+                        .map(|monitor| monitor.display_text())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                }
+            })
+            .collect::<Vec<_>>();
 
         app.projects()
             .iter()
             .zip(labels)
-            .map(|(project, label)| {
+            .zip(agents)
+            .map(|((project, label), agents)| {
                 let text = format!(
-                    "{label:<label_width$}  {branch:<branch_width$}  {status}",
+                    "{label:<label_width$}  {branch:<branch_width$}  {status:<status_width$}  {agents}",
                     branch = project.branch,
                     status = project.status_summary.display_text(),
+                    agents = agents,
                     label_width = label_width,
                     branch_width = branch_width,
+                    status_width = status_width,
                 );
                 ListItem::new(text)
             })

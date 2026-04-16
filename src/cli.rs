@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use crate::wezterm::{PaneInfo, WeztermClient, listable_panes, sort_panes, tui_pane_id_from_env};
 
@@ -10,6 +10,12 @@ use crate::wezterm::{PaneInfo, WeztermClient, listable_panes, sort_panes, tui_pa
     about = "Control WezTerm panes from a Rust TUI"
 )]
 pub struct Cli {
+    #[arg(long = "install-hooks-claude")]
+    pub install_hooks_claude: bool,
+
+    #[arg(long = "install-hooks-opencode")]
+    pub install_hooks_opencode: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -20,6 +26,20 @@ pub enum Commands {
     List,
     /// Validate that WezTerm integration prerequisites are available
     Doctor,
+    #[command(hide = true)]
+    Internal(InternalCli),
+}
+
+#[derive(Debug, Args)]
+pub struct InternalCli {
+    #[command(subcommand)]
+    pub command: InternalCommands,
+}
+
+#[derive(Debug, Subcommand, Clone, Copy)]
+pub enum InternalCommands {
+    IngestClaudeHook,
+    IngestOpencodeEvent,
 }
 
 pub fn run_list<W: WeztermClient>(wezterm: &mut W) -> Result<()> {
