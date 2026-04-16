@@ -42,9 +42,7 @@ fn run_loop<W: WeztermClient>(
         }
 
         if let Event::Key(key) = event::read()? {
-            if let Some(action) =
-                action_for_key(app.active_tab(), app.mode(), app.is_input_active(), key)
-            {
+            if let Some(action) = action_for_key(app.is_input_active(), app.is_forwarding(), key) {
                 if let Err(error) = app.apply(action, wezterm) {
                     app.record_error(error.to_string());
                 }

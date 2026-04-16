@@ -1,6 +1,6 @@
 # Nerve Center
 
-`nerve_center` shows a list of projects and panes in a terminal UI.
+`nerve_center` shows a list of projects in a terminal UI.
 
 ## Config
 
@@ -10,7 +10,17 @@ On first start, `nerve_center` creates `~/.config/nerve_center/config.toml` with
 repo_sources = ["~/repos"]
 ```
 
-`repo_sources` is the list of directories scanned for the `Projects` tab. Every configured path must exist and be a directory or startup will fail with an error naming the invalid path.
+`repo_sources` is the list of directories scanned for the projects view. Every configured path must exist and be a directory or startup will fail with an error naming the invalid path.
+
+## Keybindings
+
+- `j` / `k`: move project selection
+- `:`: run a project command
+- `i`: swap the first running agent for the selected project into the side pane and refocus the TUI
+- `o`: open the selected project in IntelliJ IDEA via `idea <project-path>`
+- `t`: spawn a terminal for the selected project and swap it into the side pane without refocusing the TUI
+- `e`: spawn `nvim` for the selected project and swap it into the side pane without refocusing the TUI
+- `q`: quit
 
 ## Releases
 
@@ -48,7 +58,7 @@ These installers write agent state files to `~/.local/data/nerve_center/<wezterm
 
 ## Project Status View
 
-Each project row in the `Projects` view is shown as:
+Each project row in the projects view is shown as:
 
 ```text
 project-name  branch  status  agents

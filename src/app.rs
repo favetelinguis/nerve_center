@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -19,14 +19,7 @@ use crate::wezterm::{
 pub enum Mode {
     #[default]
     Normal,
-    Insert,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AppTab {
-    #[default]
-    Projects,
-    Panes,
+    Forwarding,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,12 +98,6 @@ pub struct PaneRow {
     pub pane: PaneInfo,
 }
 
-impl PaneRow {
-    pub fn is_attached(&self, attached_pane_id: Option<u64>) -> bool {
-        attached_pane_id == Some(self.pane.pane_id)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentRuntime {
     Claude,
@@ -155,6 +142,7 @@ impl AgentRuntime {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentMonitorState {
+    Starting,
     Working,
     NeedsInput,
     Done,
@@ -176,6 +164,7 @@ impl AgentMonitorState {
 
     fn short_code(self) -> char {
         match self {
+            Self::Starting => 's',
             Self::Working => 'w',
             Self::NeedsInput => 'i',
             Self::Done => 'd',
@@ -204,7 +193,7 @@ impl ProjectAgentMonitor {
 
 #[derive(Debug, Clone)]
 enum InputMode {
-    Command { tab: AppTab, command: String },
+    Command { command: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,15 +216,14 @@ struct AppConfig {
 #[derive(Debug)]
 pub struct App {
     rows: Vec<PaneRow>,
-    selected_index: usize,
     projects: Vec<ProjectEntry>,
     project_agent_monitors: Vec<Vec<ProjectAgentMonitor>>,
+    launched_agents: BTreeMap<u64, AgentRuntime>,
     selected_project_index: usize,
     repo_sources: Vec<PathBuf>,
-    active_tab: AppTab,
-    mode: Mode,
     tui_pane_id: u64,
     attached_pane_id: Option<u64>,
+    mode: Mode,
     input_mode: Option<InputMode>,
     status_message: String,
     last_error: Option<String>,
@@ -268,15 +256,14 @@ impl App {
 
         let mut app = Self {
             rows: Vec::new(),
-            selected_index: 0,
             projects: Vec::new(),
             project_agent_monitors: Vec::new(),
+            launched_agents: BTreeMap::new(),
             selected_project_index: 0,
             repo_sources,
-            active_tab: AppTab::Projects,
-            mode: Mode::Normal,
             tui_pane_id,
             attached_pane_id: None,
+            mode: Mode::Normal,
             input_mode: None,
             status_message: String::new(),
             last_error: None,
@@ -284,20 +271,8 @@ impl App {
         };
         app.replace_projects(projects, None);
         app.replace_rows(panes)?;
-        app.set_status(format!(
-            "Loaded {} projects and {} panes",
-            app.projects.len(),
-            app.rows.len()
-        ));
+        app.set_status(format!("Loaded {} projects", app.projects.len()));
         Ok(app)
-    }
-
-    pub fn active_tab(&self) -> AppTab {
-        self.active_tab
-    }
-
-    pub fn mode(&self) -> Mode {
-        self.mode
     }
 
     pub fn projects(&self) -> &[ProjectEntry] {
@@ -319,16 +294,8 @@ impl App {
         self.input_mode.is_some()
     }
 
-    pub fn rows(&self) -> &[PaneRow] {
-        &self.rows
-    }
-
-    pub fn selected_index(&self) -> usize {
-        self.selected_index
-    }
-
-    pub fn attached_pane_id(&self) -> Option<u64> {
-        self.attached_pane_id
+    pub fn is_forwarding(&self) -> bool {
+        self.mode == Mode::Forwarding
     }
 
     pub fn should_quit(&self) -> bool {
@@ -354,26 +321,17 @@ impl App {
 
     pub fn input_line(&self) -> String {
         match self.input_mode.as_ref() {
-            Some(InputMode::Command { tab, command }) => {
-                let scope = match tab {
-                    AppTab::Projects => self
-                        .selected_project()
-                        .map(|project| project.name.as_str())
-                        .unwrap_or("-"),
-                    AppTab::Panes => "panes",
-                };
-                let tab = match tab {
-                    AppTab::Projects => "Projects",
-                    AppTab::Panes => "Panes",
-                };
-                format!("{tab} command for {scope}: :{command}")
-            }
-            None => match self.active_tab {
-                AppTab::Projects => {
-                    ": command on selected project, e.g. wt add <branch>".to_string()
-                }
-                AppTab::Panes => ": command on active tab".to_string(),
+            Some(InputMode::Command { command }) => format!(
+                "Project command for {}: :{command}",
+                self.selected_project()
+                    .map(|project| project.name.as_str())
+                    .unwrap_or("-")
+            ),
+            None if self.mode == Mode::Forwarding => match self.attached_pane_id {
+                Some(pane_id) => format!("Forwarding keys to pane {pane_id} (Esc to return)"),
+                None => ": command on selected project, e.g. wt add <branch>".to_string(),
             },
+            None => ": command on selected project, e.g. wt add <branch>".to_string(),
         }
     }
 
@@ -383,24 +341,6 @@ impl App {
 
     pub fn apply<W: WeztermClient>(&mut self, action: AppAction, wezterm: &mut W) -> Result<()> {
         match action {
-            AppAction::SwitchToProjects => {
-                self.active_tab = AppTab::Projects;
-                self.set_status("Projects tab");
-                Ok(())
-            }
-            AppAction::SwitchToPanes => {
-                self.active_tab = AppTab::Panes;
-                self.set_status("Panes tab");
-                Ok(())
-            }
-            AppAction::MoveUp => {
-                self.move_up();
-                Ok(())
-            }
-            AppAction::MoveDown => {
-                self.move_down();
-                Ok(())
-            }
             AppAction::ProjectMoveUp => {
                 self.project_move_up();
                 Ok(())
@@ -426,26 +366,29 @@ impl App {
                 self.delete_input_char();
                 Ok(())
             }
-            AppAction::AttachSelected => self.attach_selected(wezterm),
-            AppAction::OpenProjectShell => self.open_project_tab(wezterm, SpawnCommand::shell()),
-            AppAction::OpenProjectEditor => self.open_project_tab(wezterm, SpawnCommand::nvim()),
-            AppAction::OpenProjectGit => self.open_project_tab(wezterm, SpawnCommand::lazygit()),
+            AppAction::AttachProjectAgent => self.attach_project_agent(wezterm),
+            AppAction::OpenProjectIdea => self.open_project_idea(),
+            AppAction::OpenProjectTerminal => {
+                self.open_project_in_other_pane(wezterm, SpawnCommand::shell())
+            }
+            AppAction::OpenProjectEditor => {
+                self.open_project_in_other_pane(wezterm, SpawnCommand::nvim())
+            }
+            AppAction::ExitForwarding => {
+                self.mode = Mode::Normal;
+                self.set_status("Stopped forwarding keys");
+                Ok(())
+            }
+            AppAction::Forward(text) => self.forward_text(wezterm, &text),
             AppAction::Quit => {
                 self.should_quit = true;
                 self.set_status("Quit");
                 Ok(())
             }
-            AppAction::ExitInsert => {
-                self.mode = Mode::Normal;
-                self.set_status("Exited insert mode");
-                Ok(())
-            }
-            AppAction::Forward(text) => self.forward_text(wezterm, &text),
         }
     }
 
     fn replace_rows(&mut self, panes: Vec<PaneInfo>) -> Result<()> {
-        let previous_selection = self.selected_row().map(|row| row.pane.pane_id);
         let layout = tui_tab_layout(&panes, self.tui_pane_id)?;
         self.attached_pane_id = match layout {
             TuiTabLayout::Attached(pane) => Some(pane.pane_id),
@@ -458,16 +401,9 @@ impl App {
             .collect::<Vec<_>>();
         rows.sort_by_key(|row| (row.pane.window_id, row.pane.tab_id, row.pane.pane_id));
         self.rows = rows;
-
-        self.selected_index = previous_selection
-            .and_then(|pane_id| self.rows.iter().position(|row| row.pane.pane_id == pane_id))
-            .unwrap_or(0);
-
-        if self.selected_index >= self.rows.len() {
-            self.selected_index = self.rows.len().saturating_sub(1);
-        }
-
-        if self.rows.is_empty() {
+        self.launched_agents
+            .retain(|pane_id, _| self.rows.iter().any(|row| row.pane.pane_id == *pane_id));
+        if self.attached_pane_id.is_none() {
             self.mode = Mode::Normal;
         }
 
@@ -475,28 +411,8 @@ impl App {
         Ok(())
     }
 
-    fn selected_row(&self) -> Option<&PaneRow> {
-        self.rows.get(self.selected_index)
-    }
-
-    fn selected_pane_id(&self) -> Option<u64> {
-        self.selected_row().map(|row| row.pane.pane_id)
-    }
-
     fn selected_project(&self) -> Option<&ProjectEntry> {
         self.projects.get(self.selected_project_index)
-    }
-
-    fn move_up(&mut self) {
-        if !self.rows.is_empty() && self.selected_index > 0 {
-            self.selected_index -= 1;
-        }
-    }
-
-    fn move_down(&mut self) {
-        if !self.rows.is_empty() && self.selected_index + 1 < self.rows.len() {
-            self.selected_index += 1;
-        }
     }
 
     fn project_move_up(&mut self) {
@@ -513,7 +429,6 @@ impl App {
 
     fn start_command_input(&mut self) {
         self.input_mode = Some(InputMode::Command {
-            tab: self.active_tab,
             command: String::new(),
         });
         self.set_status("Command input");
@@ -525,7 +440,7 @@ impl App {
         };
 
         match input_mode {
-            InputMode::Command { command, .. } => command.push(c),
+            InputMode::Command { command } => command.push(c),
         }
         self.last_error = None;
     }
@@ -536,7 +451,7 @@ impl App {
         };
 
         match input_mode {
-            InputMode::Command { command, .. } => {
+            InputMode::Command { command } => {
                 command.pop();
             }
         }
@@ -554,9 +469,9 @@ impl App {
         };
 
         match input_mode {
-            InputMode::Command { tab, command } => {
+            InputMode::Command { command } => {
                 self.input_mode = None;
-                self.execute_command(tab, &command, wezterm)
+                self.execute_project_command(&command, wezterm)
             }
         }
     }
@@ -591,9 +506,8 @@ impl App {
         Ok(())
     }
 
-    fn execute_command<W: WeztermClient>(
+    fn execute_project_command<W: WeztermClient>(
         &mut self,
-        tab: AppTab,
         command: &str,
         wezterm: &mut W,
     ) -> Result<()> {
@@ -603,17 +517,6 @@ impl App {
             return Ok(());
         }
 
-        match tab {
-            AppTab::Projects => self.execute_project_command(command, wezterm),
-            AppTab::Panes => bail!("no commands are implemented for the panes tab"),
-        }
-    }
-
-    fn execute_project_command<W: WeztermClient>(
-        &mut self,
-        command: &str,
-        wezterm: &mut W,
-    ) -> Result<()> {
         match parse_project_command(command)? {
             ProjectCommand::Add { branch } => self.add_selected_worktree(&branch, wezterm),
             ProjectCommand::Remove => self.remove_selected_worktree(wezterm),
@@ -630,7 +533,7 @@ impl App {
                 self.remove_selected_worktree(wezterm)
             }
             ProjectCommand::Agent { runtime } => {
-                self.open_project_tab(wezterm, runtime.spawn_command())?;
+                self.open_project_agent_tab(wezterm, runtime)?;
                 Ok(())
             }
         }
@@ -753,29 +656,55 @@ impl App {
         Ok(())
     }
 
-    fn attach_selected<W: WeztermClient>(&mut self, wezterm: &mut W) -> Result<()> {
-        let selected_pane_id = match self.selected_pane_id() {
-            Some(pane_id) => pane_id,
+    fn attach_project_agent<W: WeztermClient>(&mut self, wezterm: &mut W) -> Result<()> {
+        let project = match self.selected_project() {
+            Some(project) => project.clone(),
             None => {
-                self.record_error("No selectable panes");
+                self.record_error("No projects found");
                 return Ok(());
             }
         };
 
+        let Some(pane_id) = self.agent_pane_id_for_project(self.selected_project_index()) else {
+            self.record_error("Start an agent for this project first");
+            return Ok(());
+        };
+
+        if !self.attach_pane_into_tui(wezterm, pane_id, true)? {
+            return Ok(());
+        }
+        self.mode = Mode::Forwarding;
+        self.set_status(format!(
+            "Attached agent pane {} for {} and forwarding keys",
+            pane_id, project.name
+        ));
+        Ok(())
+    }
+
+    fn attach_pane_into_tui<W: WeztermClient>(
+        &mut self,
+        wezterm: &mut W,
+        pane_id: u64,
+        refocus_tui: bool,
+    ) -> Result<bool> {
         let panes = wezterm.list_panes()?;
-        let _selected = find_pane(&panes, selected_pane_id)?;
+        let _selected = find_pane(&panes, pane_id)?;
         let layout = tui_tab_layout(&panes, self.tui_pane_id)?;
 
         match layout {
             TuiTabLayout::Unsupported { .. } => {
                 self.record_error("unsupported layout");
-                return Ok(());
+                return Ok(false);
             }
-            TuiTabLayout::Attached(attached) if attached.pane_id == selected_pane_id => {
-                self.mode = Mode::Insert;
-                self.attached_pane_id = Some(selected_pane_id);
-                self.set_status(format!("Insert mode for pane {selected_pane_id}"));
-                return Ok(());
+            TuiTabLayout::Attached(attached) if attached.pane_id == pane_id => {
+                self.attached_pane_id = Some(pane_id);
+                if refocus_tui {
+                    wezterm.activate_pane(self.tui_pane_id)?;
+                } else {
+                    wezterm.activate_pane(pane_id)?;
+                }
+                self.refresh(wezterm)?;
+                return Ok(true);
             }
             TuiTabLayout::Attached(attached) => {
                 wezterm.move_pane_to_new_tab(attached.pane_id)?;
@@ -783,27 +712,37 @@ impl App {
             TuiTabLayout::Solo => {}
         }
 
-        wezterm.split_pane(self.tui_pane_id, selected_pane_id, SplitDirection::Right)?;
-        wezterm.activate_pane(self.tui_pane_id)?;
+        wezterm.split_pane(self.tui_pane_id, pane_id, SplitDirection::Right)?;
+        if refocus_tui {
+            wezterm.activate_pane(self.tui_pane_id)?;
+        } else {
+            wezterm.activate_pane(pane_id)?;
+        }
 
-        self.attached_pane_id = Some(selected_pane_id);
-        self.mode = Mode::Insert;
-        self.set_status(format!("Insert mode for pane {selected_pane_id}"));
+        self.attached_pane_id = Some(pane_id);
         self.refresh(wezterm)?;
 
+        Ok(true)
+    }
+
+    fn open_project_idea(&mut self) -> Result<()> {
+        let project = match self.selected_project() {
+            Some(project) => project.clone(),
+            None => {
+                self.record_error("No projects found");
+                return Ok(());
+            }
+        };
+
+        Command::new("idea")
+            .arg(&project.cwd)
+            .spawn()
+            .with_context(|| format!("failed to launch IntelliJ IDEA for {}", project.cwd))?;
+        self.set_status(format!("Opened idea for {}", project.name));
         Ok(())
     }
 
-    fn forward_text<W: WeztermClient>(&mut self, wezterm: &mut W, text: &str) -> Result<()> {
-        let attached_pane_id = self
-            .attached_pane_id
-            .ok_or_else(|| anyhow!("cannot forward keys without an attached pane"))?;
-        wezterm.send_text(attached_pane_id, text)?;
-        self.last_error = None;
-        Ok(())
-    }
-
-    fn open_project_tab<W: WeztermClient>(
+    fn open_project_in_other_pane<W: WeztermClient>(
         &mut self,
         wezterm: &mut W,
         command: SpawnCommand,
@@ -816,15 +755,68 @@ impl App {
             }
         };
 
-        wezterm.spawn_new_tab(self.tui_pane_id, &project.cwd, &command)?;
-        wezterm.activate_pane(self.tui_pane_id)?;
-        self.refresh(wezterm)?;
+        let pane_id = wezterm.spawn_new_tab(self.tui_pane_id, &project.cwd, &command)?;
+        if !self.attach_pane_into_tui(wezterm, pane_id, false)? {
+            return Ok(());
+        }
         self.set_status(format!(
-            "Opened {} tab for {}",
+            "Opened {} pane for {}",
             command.label(),
             project.name
         ));
         Ok(())
+    }
+
+    fn forward_text<W: WeztermClient>(&mut self, wezterm: &mut W, text: &str) -> Result<()> {
+        let attached_pane_id = self
+            .attached_pane_id
+            .ok_or_else(|| anyhow!("cannot forward keys without an attached pane"))?;
+        wezterm.send_text(attached_pane_id, text)?;
+        self.last_error = None;
+        Ok(())
+    }
+
+    fn open_project_agent_tab<W: WeztermClient>(
+        &mut self,
+        wezterm: &mut W,
+        runtime: AgentRuntime,
+    ) -> Result<()> {
+        let project = match self.selected_project() {
+            Some(project) => project.clone(),
+            None => {
+                self.record_error("No projects found");
+                return Ok(());
+            }
+        };
+
+        let pane_id =
+            wezterm.spawn_new_tab(self.tui_pane_id, &project.cwd, &runtime.spawn_command())?;
+        self.launched_agents.insert(pane_id, runtime);
+        wezterm.activate_pane(self.tui_pane_id)?;
+        self.refresh(wezterm)?;
+        self.set_status(format!(
+            "Opened {} tab for {}",
+            runtime.label(),
+            project.name
+        ));
+        Ok(())
+    }
+
+    fn agent_pane_id_for_project(&self, project_index: usize) -> Option<u64> {
+        self.project_agent_monitors(project_index)
+            .first()
+            .map(|monitor| monitor.pane_id)
+            .or_else(|| {
+                self.rows.iter().find_map(|row| {
+                    if !self.launched_agents.contains_key(&row.pane.pane_id) {
+                        return None;
+                    }
+
+                    let cwd = normalize_pane_cwd(&row.pane.cwd)?;
+                    (project_index_for_cwd(&self.projects, &cwd) == Some(project_index))
+                        .then_some(row.pane.pane_id)
+                })
+            })
     }
 
     fn refresh<W: WeztermClient>(&mut self, wezterm: &mut W) -> Result<()> {
@@ -870,11 +862,36 @@ impl App {
     fn refresh_project_agent_monitors(&mut self) {
         let mut monitors = vec![Vec::new(); self.projects.len()];
         let pane_monitors = load_pane_agent_monitors(&self.rows);
+        let mut monitored_pane_ids = BTreeSet::new();
 
         for (pane_cwd, monitor) in pane_monitors {
+            monitored_pane_ids.insert(monitor.pane_id);
             if let Some(project_index) = project_index_for_cwd(&self.projects, &pane_cwd) {
                 monitors[project_index].push(monitor);
             }
+        }
+
+        for row in &self.rows {
+            let pane_id = row.pane.pane_id;
+            let Some(runtime) = self.launched_agents.get(&pane_id).copied() else {
+                continue;
+            };
+            if monitored_pane_ids.contains(&pane_id) {
+                continue;
+            }
+
+            let Some(cwd) = normalize_pane_cwd(&row.pane.cwd) else {
+                continue;
+            };
+            let Some(project_index) = project_index_for_cwd(&self.projects, &cwd) else {
+                continue;
+            };
+
+            monitors[project_index].push(ProjectAgentMonitor {
+                pane_id,
+                runtime,
+                state: AgentMonitorState::Starting,
+            });
         }
 
         for project_monitors in &mut monitors {
@@ -1800,17 +1817,20 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use anyhow::Result;
 
     use super::{
-        App, AppTab, GitProjectProbe, Mode, ProjectEntry, ProjectKind, ProjectStatusSummary,
+        App, GitProjectProbe, Mode, ProjectEntry, ProjectKind, ProjectStatusSummary,
         build_project_entries, parse_project_command, parse_project_status_output,
         run_git_branch_delete, run_git_worktree_remove,
     };
     use crate::input::AppAction;
     use crate::wezterm::{PaneInfo, SpawnCommand, SplitDirection, WeztermClient};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum Call {
@@ -1837,13 +1857,22 @@ mod tests {
     struct FakeWezterm {
         snapshots: VecDeque<Vec<PaneInfo>>,
         calls: Vec<Call>,
+        next_spawned_pane_id: u64,
     }
 
     impl FakeWezterm {
         fn new(snapshots: Vec<Vec<PaneInfo>>) -> Self {
+            let next_spawned_pane_id = snapshots
+                .iter()
+                .flatten()
+                .map(|pane| pane.pane_id)
+                .max()
+                .unwrap_or(0)
+                + 1;
             Self {
                 snapshots: snapshots.into(),
                 calls: Vec::new(),
+                next_spawned_pane_id,
             }
         }
 
@@ -1852,6 +1881,33 @@ mod tests {
                 .front()
                 .expect("at least one snapshot is required")
                 .clone()
+        }
+
+        fn next_tab_id(&self) -> u64 {
+            self.snapshots
+                .iter()
+                .flatten()
+                .map(|pane| pane.tab_id)
+                .max()
+                .unwrap_or(0)
+                + 1
+        }
+
+        fn move_pane_to_tab(&mut self, pane_id: u64, tab_id: u64, window_id: u64) {
+            for snapshot in &mut self.snapshots {
+                if let Some(pane) = snapshot.iter_mut().find(|pane| pane.pane_id == pane_id) {
+                    pane.tab_id = tab_id;
+                    pane.window_id = window_id;
+                }
+            }
+        }
+
+        fn set_active_pane(&mut self, pane_id: u64) {
+            for snapshot in &mut self.snapshots {
+                for pane in snapshot {
+                    pane.is_active = pane.pane_id == pane_id;
+                }
+            }
         }
     }
 
@@ -1867,6 +1923,14 @@ mod tests {
 
         fn move_pane_to_new_tab(&mut self, pane_id: u64) -> Result<()> {
             self.calls.push(Call::MovePaneToNewTab(pane_id));
+            let window_id = self
+                .current_snapshot()
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .map(|pane| pane.window_id)
+                .expect("pane should exist when moved to a new tab");
+            let tab_id = self.next_tab_id();
+            self.move_pane_to_tab(pane_id, tab_id, window_id);
             Ok(())
         }
 
@@ -1881,11 +1945,19 @@ mod tests {
                 move_pane_id,
                 direction,
             });
+            let host = self
+                .current_snapshot()
+                .iter()
+                .find(|pane| pane.pane_id == host_pane_id)
+                .cloned()
+                .expect("host pane should exist when splitting");
+            self.move_pane_to_tab(move_pane_id, host.tab_id, host.window_id);
             Ok(())
         }
 
         fn activate_pane(&mut self, pane_id: u64) -> Result<()> {
             self.calls.push(Call::ActivatePane(pane_id));
+            self.set_active_pane(pane_id);
             Ok(())
         }
 
@@ -1897,13 +1969,34 @@ mod tests {
             Ok(())
         }
 
-        fn spawn_new_tab(&mut self, pane_id: u64, cwd: &str, command: &SpawnCommand) -> Result<()> {
+        fn spawn_new_tab(
+            &mut self,
+            pane_id: u64,
+            cwd: &str,
+            command: &SpawnCommand,
+        ) -> Result<u64> {
             self.calls.push(Call::SpawnNewTab {
                 pane_id,
                 cwd: cwd.to_string(),
                 command: command.clone(),
             });
-            Ok(())
+            let spawned_pane_id = self.next_spawned_pane_id;
+            self.next_spawned_pane_id += 1;
+            let host = self
+                .current_snapshot()
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .cloned()
+                .expect("host pane should exist when spawning a tab");
+            let new_tab_id = self.next_tab_id();
+
+            for snapshot in &mut self.snapshots {
+                let mut spawned = pane(spawned_pane_id, new_tab_id, host.window_id);
+                spawned.cwd = format!("file://{cwd}");
+                snapshot.push(spawned);
+            }
+
+            Ok(spawned_pane_id)
         }
     }
 
@@ -1972,148 +2065,14 @@ mod tests {
     }
 
     #[test]
-    fn split_pane_when_tui_is_alone() {
-        set_wezterm_pane();
-        let snapshots = vec![
-            vec![pane(10, 1, 1), pane(20, 2, 1)],
-            vec![pane(10, 1, 1), pane(20, 2, 1)],
-            vec![pane(10, 1, 1), pane(20, 1, 1)],
-        ];
-        let mut wezterm = FakeWezterm::new(snapshots);
-        let mut app =
-            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
-
-        app.apply(AppAction::AttachSelected, &mut wezterm)
-            .expect("attach should succeed");
-
-        assert_eq!(app.mode(), Mode::Insert);
-        assert_eq!(app.attached_pane_id(), Some(20));
-        assert_eq!(
-            wezterm.calls,
-            vec![
-                Call::ListPanes,
-                Call::ListPanes,
-                Call::SplitPane {
-                    host_pane_id: 10,
-                    move_pane_id: 20,
-                    direction: SplitDirection::Right,
-                },
-                Call::ActivatePane(10),
-                Call::ListPanes,
-            ]
-        );
-    }
-
-    #[test]
-    fn switching_panes_moves_old_neighbor_out_first() {
-        set_wezterm_pane();
-        let snapshots = vec![
-            vec![pane(10, 1, 1), pane(20, 1, 1), pane(30, 2, 1)],
-            vec![pane(10, 1, 1), pane(20, 1, 1), pane(30, 2, 1)],
-            vec![pane(10, 1, 1), pane(30, 1, 1), pane(20, 3, 1)],
-        ];
-        let mut wezterm = FakeWezterm::new(snapshots);
-        let mut app =
-            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
-        app.apply(AppAction::MoveDown, &mut wezterm)
-            .expect("selection should move");
-
-        app.apply(AppAction::AttachSelected, &mut wezterm)
-            .expect("switch should succeed");
-
-        assert_eq!(app.mode(), Mode::Insert);
-        assert_eq!(app.attached_pane_id(), Some(30));
-        assert_eq!(
-            wezterm.calls,
-            vec![
-                Call::ListPanes,
-                Call::ListPanes,
-                Call::MovePaneToNewTab(20),
-                Call::SplitPane {
-                    host_pane_id: 10,
-                    move_pane_id: 30,
-                    direction: SplitDirection::Right,
-                },
-                Call::ActivatePane(10),
-                Call::ListPanes,
-            ]
-        );
-    }
-
-    #[test]
-    fn selecting_currently_attached_pane_skips_layout_mutation() {
-        set_wezterm_pane();
-        let snapshots = vec![vec![pane(10, 1, 1), pane(20, 1, 1), pane(30, 2, 1)]];
-        let mut wezterm = FakeWezterm::new(snapshots);
-        let mut app =
-            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
-
-        app.apply(AppAction::AttachSelected, &mut wezterm)
-            .expect("attach should succeed");
-
-        assert_eq!(app.mode(), Mode::Insert);
-        assert_eq!(app.attached_pane_id(), Some(20));
-        assert_eq!(wezterm.calls, vec![Call::ListPanes, Call::ListPanes]);
-    }
-
-    #[test]
-    fn unsupported_layout_does_not_run_commands() {
-        set_wezterm_pane();
-        let snapshots = vec![vec![
-            pane(10, 1, 1),
-            pane(20, 1, 1),
-            pane(30, 1, 1),
-            pane(40, 2, 1),
-        ]];
-        let mut wezterm = FakeWezterm::new(snapshots);
-        let mut app =
-            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
-
-        app.apply(AppAction::MoveDown, &mut wezterm)
-            .expect("selection should move");
-        app.apply(AppAction::AttachSelected, &mut wezterm)
-            .expect("unsupported layout should not error");
-
-        assert_eq!(app.mode(), Mode::Normal);
-        assert!(app.status_line().contains("unsupported layout"));
-        assert_eq!(wezterm.calls, vec![Call::ListPanes, Call::ListPanes]);
-    }
-
-    #[test]
-    fn insert_mode_forwards_text_to_attached_pane() {
-        set_wezterm_pane();
-        let snapshots = vec![vec![pane(10, 1, 1), pane(20, 1, 1)]];
-        let mut wezterm = FakeWezterm::new(snapshots);
-        let mut app =
-            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
-        app.apply(AppAction::AttachSelected, &mut wezterm)
-            .expect("attach should succeed");
-
-        app.apply(AppAction::Forward("x".to_string()), &mut wezterm)
-            .expect("forward should succeed");
-
-        assert_eq!(
-            wezterm.calls,
-            vec![
-                Call::ListPanes,
-                Call::ListPanes,
-                Call::SendText {
-                    pane_id: 20,
-                    text: "x".to_string(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn loads_on_projects_tab_by_default() {
+    fn loads_projects_view_by_default() {
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
         let app = App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
 
-        assert_eq!(app.active_tab(), AppTab::Projects);
         assert_eq!(app.selected_project_index(), 0);
         assert_eq!(app.projects().len(), 2);
+        assert!(app.input_line().contains("selected project"));
     }
 
     #[test]
@@ -2145,7 +2104,7 @@ mod tests {
             .expect("input should accept text");
 
         assert!(app.is_input_active());
-        assert!(app.input_line().contains("Projects command for alpha: :r"));
+        assert!(app.input_line().contains("Project command for alpha: :r"));
     }
 
     #[test]
@@ -2402,6 +2361,7 @@ mod tests {
 
     #[test]
     fn pr_command_pushes_branch_and_creates_pull_request() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let fixture = create_worktree_fixture("pr-command");
         git(
             &fixture.root,
@@ -2454,33 +2414,162 @@ exit 1
     }
 
     #[test]
-    fn switching_tabs_preserves_pane_mode() {
-        set_wezterm_pane();
-        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 1, 1)]]);
-        let mut app =
-            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
-
-        app.apply(AppAction::SwitchToPanes, &mut wezterm)
-            .expect("switch should succeed");
-        app.apply(AppAction::AttachSelected, &mut wezterm)
-            .expect("attach should succeed");
-        app.apply(AppAction::SwitchToProjects, &mut wezterm)
-            .expect("switch should succeed");
-        app.apply(AppAction::SwitchToPanes, &mut wezterm)
-            .expect("switch should succeed");
-
-        assert_eq!(app.active_tab(), AppTab::Panes);
-        assert_eq!(app.mode(), Mode::Insert);
-    }
-
-    #[test]
-    fn project_shell_open_spawns_and_refocuses_tui() {
+    fn attach_project_agent_requires_existing_agent() {
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
         let mut app =
             App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
 
-        app.apply(AppAction::OpenProjectShell, &mut wezterm)
+        app.apply(AppAction::AttachProjectAgent, &mut wezterm)
+            .expect("attach should not error");
+
+        assert!(
+            app.status_line()
+                .contains("Start an agent for this project first")
+        );
+        assert_eq!(wezterm.calls, vec![Call::ListPanes]);
+    }
+
+    #[test]
+    fn attach_project_agent_and_refocuses_tui() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let state_dir = test_sandbox("attach-project-agent");
+        write_file(
+            &state_dir.join("20"),
+            r#"{"source":"claude","effective_state":"working"}"#,
+        );
+        unsafe {
+            env::set_var("NERVE_CENTER_DATA_DIR", root_as_str(&state_dir));
+        }
+
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![
+            pane_with_cwd(10, 1, 1, "file:///tmp/repos/nerve_center"),
+            pane_with_cwd(20, 2, 1, "file:///tmp/repos/alpha"),
+        ]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        let result = app.apply(AppAction::AttachProjectAgent, &mut wezterm);
+
+        unsafe {
+            env::remove_var("NERVE_CENTER_DATA_DIR");
+        }
+        result.expect("attach should succeed");
+
+        assert_eq!(app.attached_pane_id, Some(20));
+        assert_eq!(
+            wezterm.calls,
+            vec![
+                Call::ListPanes,
+                Call::ListPanes,
+                Call::SplitPane {
+                    host_pane_id: 10,
+                    move_pane_id: 20,
+                    direction: SplitDirection::Right,
+                },
+                Call::ActivatePane(10),
+                Call::ListPanes,
+            ]
+        );
+    }
+
+    #[test]
+    fn attach_project_agent_starts_forwarding_and_escape_stops_it() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let state_dir = test_sandbox("attach-project-agent-forwarding");
+        write_file(
+            &state_dir.join("20"),
+            r#"{"source":"claude","effective_state":"working"}"#,
+        );
+        unsafe {
+            env::set_var("NERVE_CENTER_DATA_DIR", root_as_str(&state_dir));
+        }
+
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![
+            pane_with_cwd(10, 1, 1, "file:///tmp/repos/nerve_center"),
+            pane_with_cwd(20, 2, 1, "file:///tmp/repos/alpha"),
+        ]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        let result = app.apply(AppAction::AttachProjectAgent, &mut wezterm);
+
+        unsafe {
+            env::remove_var("NERVE_CENTER_DATA_DIR");
+        }
+        result.expect("attach should succeed");
+        assert_eq!(app.mode, Mode::Forwarding);
+        assert!(app.input_line().contains("Forwarding keys to pane 20"));
+
+        app.apply(AppAction::Forward("i".to_string()), &mut wezterm)
+            .expect("forward should succeed");
+        app.apply(AppAction::ExitForwarding, &mut wezterm)
+            .expect("exit forwarding should succeed");
+
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(
+            wezterm.calls,
+            vec![
+                Call::ListPanes,
+                Call::ListPanes,
+                Call::SplitPane {
+                    host_pane_id: 10,
+                    move_pane_id: 20,
+                    direction: SplitDirection::Right,
+                },
+                Call::ActivatePane(10),
+                Call::ListPanes,
+                Call::SendText {
+                    pane_id: 20,
+                    text: "i".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unsupported_layout_does_not_run_project_attach_commands() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let state_dir = test_sandbox("attach-project-agent-unsupported");
+        write_file(
+            &state_dir.join("40"),
+            r#"{"source":"claude","effective_state":"working"}"#,
+        );
+        unsafe {
+            env::set_var("NERVE_CENTER_DATA_DIR", root_as_str(&state_dir));
+        }
+
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![
+            pane(10, 1, 1),
+            pane(20, 1, 1),
+            pane(30, 1, 1),
+            pane_with_cwd(40, 2, 1, "file:///tmp/repos/alpha"),
+        ]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        let result = app.apply(AppAction::AttachProjectAgent, &mut wezterm);
+
+        unsafe {
+            env::remove_var("NERVE_CENTER_DATA_DIR");
+        }
+        result.expect("unsupported layout should not error");
+
+        assert!(app.status_line().contains("unsupported layout"));
+        assert_eq!(wezterm.calls, vec![Call::ListPanes, Call::ListPanes]);
+    }
+
+    #[test]
+    fn project_terminal_open_spawns_and_switches_without_refocusing_tui() {
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 1, 1)]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        app.apply(AppAction::OpenProjectTerminal, &mut wezterm)
             .expect("open should succeed");
 
         assert_eq!(
@@ -2492,10 +2581,18 @@ exit 1
                     cwd: "/tmp/repos/alpha".to_string(),
                     command: SpawnCommand::shell(),
                 },
-                Call::ActivatePane(10),
+                Call::ListPanes,
+                Call::MovePaneToNewTab(20),
+                Call::SplitPane {
+                    host_pane_id: 10,
+                    move_pane_id: 21,
+                    direction: SplitDirection::Right,
+                },
+                Call::ActivatePane(21),
                 Call::ListPanes,
             ]
         );
+        assert_eq!(app.attached_pane_id, Some(21));
     }
 
     #[test]
@@ -2522,10 +2619,53 @@ exit 1
             ]
         );
         assert!(app.status_line().contains("Opened claude tab for alpha"));
+        assert_eq!(
+            app.project_agent_monitors(0)
+                .iter()
+                .map(|monitor| monitor.display_text())
+                .collect::<Vec<_>>(),
+            vec!["cc:21[s]"]
+        );
     }
 
     #[test]
-    fn project_actions_use_selected_project_cwd() {
+    fn attach_project_agent_works_for_agent_started_in_this_session() {
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        app.execute_project_command("agent claude", &mut wezterm)
+            .expect("agent command should succeed");
+        app.apply(AppAction::AttachProjectAgent, &mut wezterm)
+            .expect("attach should succeed");
+
+        assert_eq!(
+            wezterm.calls,
+            vec![
+                Call::ListPanes,
+                Call::SpawnNewTab {
+                    pane_id: 10,
+                    cwd: "/tmp/repos/alpha".to_string(),
+                    command: SpawnCommand::new("claude", vec!["claude".to_string()]),
+                },
+                Call::ActivatePane(10),
+                Call::ListPanes,
+                Call::ListPanes,
+                Call::SplitPane {
+                    host_pane_id: 10,
+                    move_pane_id: 21,
+                    direction: SplitDirection::Right,
+                },
+                Call::ActivatePane(10),
+                Call::ListPanes,
+            ]
+        );
+        assert_eq!(app.attached_pane_id, Some(21));
+    }
+
+    #[test]
+    fn project_editor_open_uses_selected_project_cwd_without_refocusing_tui() {
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
         let mut app =
@@ -2534,8 +2674,6 @@ exit 1
             .expect("move should succeed");
 
         app.apply(AppAction::OpenProjectEditor, &mut wezterm)
-            .expect("open should succeed");
-        app.apply(AppAction::OpenProjectGit, &mut wezterm)
             .expect("open should succeed");
 
         assert_eq!(
@@ -2547,21 +2685,69 @@ exit 1
                     cwd: "/tmp/repos/beta".to_string(),
                     command: SpawnCommand::nvim(),
                 },
-                Call::ActivatePane(10),
                 Call::ListPanes,
-                Call::SpawnNewTab {
-                    pane_id: 10,
-                    cwd: "/tmp/repos/beta".to_string(),
-                    command: SpawnCommand::lazygit(),
+                Call::SplitPane {
+                    host_pane_id: 10,
+                    move_pane_id: 21,
+                    direction: SplitDirection::Right,
                 },
-                Call::ActivatePane(10),
+                Call::ActivatePane(21),
                 Call::ListPanes,
             ]
         );
+        assert_eq!(app.attached_pane_id, Some(21));
+    }
+
+    #[test]
+    fn project_idea_open_uses_selected_project_path() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let fake_bin = test_sandbox("fake-idea-bin");
+        let idea_path = fake_bin.join("idea");
+        let log_path = fake_bin.join("idea.log");
+        write_file(
+            &idea_path,
+            &format!(
+                "#!/bin/sh
+printf '%s\n' \"$1\" > '{}'
+exit 0
+",
+                log_path.display()
+            ),
+        );
+        chmod_executable(&idea_path);
+        let original_path = env::var("PATH").unwrap_or_default();
+        let patched_path = format!("{}:{}", fake_bin.display(), original_path);
+        unsafe {
+            env::set_var("PATH", patched_path);
+        }
+
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+        app.apply(AppAction::ProjectMoveDown, &mut wezterm)
+            .expect("move should succeed");
+
+        let result = app.apply(AppAction::OpenProjectIdea, &mut wezterm);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        unsafe {
+            env::set_var("PATH", original_path);
+        }
+        result.expect("idea launch should succeed");
+
+        assert_eq!(
+            fs::read_to_string(log_path)
+                .expect("idea log should exist")
+                .trim(),
+            "/tmp/repos/beta"
+        );
+        assert_eq!(wezterm.calls, vec![Call::ListPanes]);
     }
 
     #[test]
     fn loads_multiple_agent_monitors_for_one_project() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let state_dir = test_sandbox("agent-state-dir");
         write_file(
             &state_dir.join("20"),
@@ -2596,6 +2782,52 @@ exit 1
             .collect::<Vec<_>>();
         assert_eq!(alpha_monitors, vec!["cc:20[w]", "oc:30[i]"]);
         assert!(app.project_agent_monitors(1).is_empty());
+    }
+
+    #[test]
+    fn hook_state_replaces_provisional_agent_monitor() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let state_dir = test_sandbox("agent-state-replaces-provisional");
+
+        unsafe {
+            env::set_var("NERVE_CENTER_DATA_DIR", root_as_str(&state_dir));
+        }
+
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![
+            pane_with_cwd(10, 1, 1, "file:///tmp/repos/nerve_center"),
+            pane_with_cwd(20, 2, 1, "file:///tmp/repos/alpha"),
+        ]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        app.execute_project_command("agent claude", &mut wezterm)
+            .expect("agent command should succeed");
+        assert_eq!(
+            app.project_agent_monitors(0)
+                .iter()
+                .map(|monitor| monitor.display_text())
+                .collect::<Vec<_>>(),
+            vec!["cc:21[s]"]
+        );
+
+        write_file(
+            &state_dir.join("21"),
+            r#"{"source":"claude","effective_state":"working"}"#,
+        );
+        app.refresh(&mut wezterm).expect("refresh should succeed");
+
+        unsafe {
+            env::remove_var("NERVE_CENTER_DATA_DIR");
+        }
+
+        assert_eq!(
+            app.project_agent_monitors(0)
+                .iter()
+                .map(|monitor| monitor.display_text())
+                .collect::<Vec<_>>(),
+            vec!["cc:21[w]"]
+        );
     }
 
     #[test]

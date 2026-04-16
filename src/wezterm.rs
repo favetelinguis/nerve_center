@@ -63,10 +63,6 @@ impl SpawnCommand {
         Self::new("nvim", vec!["nvim".to_string()])
     }
 
-    pub fn lazygit() -> Self {
-        Self::new("lazygit", vec!["lazygit".to_string()])
-    }
-
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -94,7 +90,7 @@ pub trait WeztermClient {
     ) -> Result<()>;
     fn activate_pane(&mut self, pane_id: u64) -> Result<()>;
     fn send_text(&mut self, pane_id: u64, text: &str) -> Result<()>;
-    fn spawn_new_tab(&mut self, pane_id: u64, cwd: &str, command: &SpawnCommand) -> Result<()>;
+    fn spawn_new_tab(&mut self, pane_id: u64, cwd: &str, command: &SpawnCommand) -> Result<u64>;
 }
 
 #[derive(Debug, Default)]
@@ -150,7 +146,7 @@ impl WeztermClient for ProcessWezterm {
         Ok(())
     }
 
-    fn spawn_new_tab(&mut self, pane_id: u64, cwd: &str, command: &SpawnCommand) -> Result<()> {
+    fn spawn_new_tab(&mut self, pane_id: u64, cwd: &str, command: &SpawnCommand) -> Result<u64> {
         let mut args = vec![
             "spawn".to_string(),
             "--pane-id".to_string(),
@@ -160,8 +156,10 @@ impl WeztermClient for ProcessWezterm {
             "--".to_string(),
         ];
         args.extend(command.argv().iter().cloned());
-        run_wezterm_cli(args)?;
-        Ok(())
+        let output = run_wezterm_cli(args)?;
+        output.trim().parse::<u64>().with_context(|| {
+            format!("failed to parse spawned pane id from wezterm cli output: {output:?}")
+        })
     }
 }
 
