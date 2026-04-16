@@ -5,14 +5,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::input::AppAction;
 use crate::wezterm::{
-    find_pane, listable_panes, tui_pane_id_from_env, tui_tab_layout, PaneInfo, SpawnCommand,
-    SplitDirection, TuiTabLayout, WeztermClient,
+    PaneInfo, SpawnCommand, SplitDirection, TuiTabLayout, WeztermClient, find_pane, listable_panes,
+    tui_pane_id_from_env, tui_tab_layout,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -331,9 +331,25 @@ impl App {
                     .map(|project| project.name.as_str())
                     .unwrap_or("-")
             ),
-            None if self.mode == Mode::Forwarding => match self.attached_pane_id {
-                Some(pane_id) => format!("Forwarding keys to pane {pane_id} (Esc to return)"),
-                None => ": command on selected project, e.g. wt add <branch>".to_string(),
+            None if self.mode == Mode::Forwarding => match self.attached_project_agent_position() {
+                Some((project_index, agent_index)) => {
+                    let project_name = self
+                        .projects
+                        .get(project_index)
+                        .map(|project| project.name.as_str())
+                        .unwrap_or("-");
+                    let monitor =
+                        self.project_agent_monitors(project_index)[agent_index].display_text();
+                    format!(
+                        "Forwarding keys to {monitor} for {project_name} (Left/Right to switch, Esc to return)"
+                    )
+                }
+                None => match self.attached_pane_id {
+                    Some(pane_id) => {
+                        format!("Forwarding keys to pane {pane_id} (Esc to return)")
+                    }
+                    None => ": command on selected project, e.g. wt add <branch>".to_string(),
+                },
             },
             None => ": command on selected project, e.g. wt add <branch>".to_string(),
         }
@@ -378,6 +394,8 @@ impl App {
             AppAction::OpenProjectEditor => {
                 self.open_project_in_other_pane(wezterm, SpawnCommand::nvim())
             }
+            AppAction::SelectPreviousProjectAgent => self.switch_project_agent(wezterm, -1),
+            AppAction::SelectNextProjectAgent => self.switch_project_agent(wezterm, 1),
             AppAction::ExitForwarding => {
                 self.mode = Mode::Normal;
                 self.set_status("Stopped forwarding keys");
@@ -661,7 +679,22 @@ impl App {
     }
 
     fn attach_project_agent<W: WeztermClient>(&mut self, wezterm: &mut W) -> Result<()> {
-        let project = match self.selected_project() {
+        let project_index = self.selected_project_index();
+        let Some(agent_index) = self.preferred_project_agent_index(project_index) else {
+            self.record_error("Start an agent for this project first");
+            return Ok(());
+        };
+
+        self.attach_project_agent_at_index(wezterm, project_index, agent_index)
+    }
+
+    fn attach_project_agent_at_index<W: WeztermClient>(
+        &mut self,
+        wezterm: &mut W,
+        project_index: usize,
+        agent_index: usize,
+    ) -> Result<()> {
+        let project = match self.projects.get(project_index) {
             Some(project) => project.clone(),
             None => {
                 self.record_error("No projects found");
@@ -669,7 +702,11 @@ impl App {
             }
         };
 
-        let Some(pane_id) = self.agent_pane_id_for_project(self.selected_project_index()) else {
+        let Some((pane_id, monitor_label)) = self
+            .project_agent_monitors(project_index)
+            .get(agent_index)
+            .map(|monitor| (monitor.pane_id, monitor.display_text()))
+        else {
             self.record_error("Start an agent for this project first");
             return Ok(());
         };
@@ -679,10 +716,67 @@ impl App {
         }
         self.mode = Mode::Forwarding;
         self.set_status(format!(
-            "Attached agent pane {} for {} and forwarding keys",
-            pane_id, project.name
+            "Attached {monitor_label} for {} and forwarding keys",
+            project.name
         ));
         Ok(())
+    }
+
+    fn preferred_project_agent_index(&self, project_index: usize) -> Option<usize> {
+        let monitors = self.project_agent_monitors(project_index);
+        if monitors.is_empty() {
+            return None;
+        }
+
+        monitors
+            .iter()
+            .position(|monitor| monitor.state == AgentMonitorState::NeedsInput)
+            .or(Some(0))
+    }
+
+    fn attached_project_agent_position(&self) -> Option<(usize, usize)> {
+        let pane_id = self.attached_pane_id?;
+
+        self.project_agent_monitors
+            .iter()
+            .enumerate()
+            .find_map(|(project_index, monitors)| {
+                monitors
+                    .iter()
+                    .position(|monitor| monitor.pane_id == pane_id)
+                    .map(|agent_index| (project_index, agent_index))
+            })
+    }
+
+    fn switch_project_agent<W: WeztermClient>(
+        &mut self,
+        wezterm: &mut W,
+        offset: isize,
+    ) -> Result<()> {
+        let Some((project_index, current_agent_index)) = self.attached_project_agent_position()
+        else {
+            self.record_error("Attach an agent first");
+            return Ok(());
+        };
+
+        let agent_count = self.project_agent_monitors(project_index).len();
+        if agent_count <= 1 {
+            return Ok(());
+        }
+
+        let target_agent_index = if offset.is_negative() {
+            current_agent_index.saturating_sub(offset.unsigned_abs())
+        } else {
+            current_agent_index
+                .saturating_add(offset as usize)
+                .min(agent_count - 1)
+        };
+
+        if target_agent_index == current_agent_index {
+            return Ok(());
+        }
+
+        self.attach_project_agent_at_index(wezterm, project_index, target_agent_index)
     }
 
     fn attach_pane_into_tui<W: WeztermClient>(
@@ -804,23 +898,6 @@ impl App {
             project.name
         ));
         Ok(())
-    }
-
-    fn agent_pane_id_for_project(&self, project_index: usize) -> Option<u64> {
-        self.project_agent_monitors(project_index)
-            .first()
-            .map(|monitor| monitor.pane_id)
-            .or_else(|| {
-                self.rows.iter().find_map(|row| {
-                    if !self.launched_agents.contains_key(&row.pane.pane_id) {
-                        return None;
-                    }
-
-                    let cwd = normalize_pane_cwd(&row.pane.cwd)?;
-                    (project_index_for_cwd(&self.projects, &cwd) == Some(project_index))
-                        .then_some(row.pane.pane_id)
-                })
-            })
     }
 
     fn refresh<W: WeztermClient>(&mut self, wezterm: &mut W) -> Result<()> {
@@ -1827,9 +1904,9 @@ mod tests {
     use anyhow::Result;
 
     use super::{
+        App, GitProjectProbe, Mode, ProjectEntry, ProjectKind, ProjectStatusSummary,
         build_project_entries, parse_project_command, parse_project_status_output,
-        run_git_branch_delete, run_git_worktree_remove, App, GitProjectProbe, Mode, ProjectEntry,
-        ProjectKind, ProjectStatusSummary,
+        run_git_branch_delete, run_git_worktree_remove,
     };
     use crate::input::AppAction;
     use crate::wezterm::{PaneInfo, SpawnCommand, SplitDirection, WeztermClient};
@@ -2128,9 +2205,11 @@ mod tests {
         let error = app
             .apply(AppAction::ConfirmInput, &mut wezterm)
             .expect_err("root remove should fail");
-        assert!(error
-            .to_string()
-            .contains("remove only works on linked worktrees"));
+        assert!(
+            error
+                .to_string()
+                .contains("remove only works on linked worktrees")
+        );
     }
 
     #[test]
@@ -2225,9 +2304,11 @@ mod tests {
         let created = &app.projects()[app.selected_project_index()];
         assert_eq!(created.branch, "feature/BOOST-3432");
         assert_eq!(created.name, "feature/BOOST-3432");
-        assert!(created
-            .cwd
-            .starts_with(&format!("{}/wt-", sandbox.display())));
+        assert!(
+            created
+                .cwd
+                .starts_with(&format!("{}/wt-", sandbox.display()))
+        );
     }
 
     #[test]
@@ -2266,9 +2347,11 @@ mod tests {
 
         let error = super::load_repo_sources_from_config_at(&config_path, &home)
             .expect_err("missing repo source should fail");
-        assert!(error
-            .to_string()
-            .contains("configured repo source does not exist"));
+        assert!(
+            error
+                .to_string()
+                .contains("configured repo source does not exist")
+        );
     }
 
     #[test]
@@ -2405,9 +2488,10 @@ exit 1
         result.expect("pr should succeed");
 
         assert!(remote_branch_exists(&fixture.remote, "feature"));
-        assert!(app
-            .status_line()
-            .contains("PR ready for feature -> main: https://example.com/pr/123"));
+        assert!(
+            app.status_line()
+                .contains("PR ready for feature -> main: https://example.com/pr/123")
+        );
     }
 
     #[test]
@@ -2420,9 +2504,10 @@ exit 1
         app.apply(AppAction::AttachProjectAgent, &mut wezterm)
             .expect("attach should not error");
 
-        assert!(app
-            .status_line()
-            .contains("Start an agent for this project first"));
+        assert!(
+            app.status_line()
+                .contains("Start an agent for this project first")
+        );
         assert_eq!(wezterm.calls, vec![Call::ListPanes]);
     }
 
@@ -2471,6 +2556,56 @@ exit 1
     }
 
     #[test]
+    fn attach_project_agent_prefers_agent_that_needs_input() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let state_dir = test_sandbox("attach-project-agent-prefers-needs-input");
+        write_file(
+            &state_dir.join("20"),
+            r#"{"source":"claude","effective_state":"working"}"#,
+        );
+        write_file(
+            &state_dir.join("30"),
+            r#"{"runtime":"opencode","effective_state":"needs_input"}"#,
+        );
+        unsafe {
+            env::set_var("NERVE_CENTER_DATA_DIR", root_as_str(&state_dir));
+        }
+
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![
+            pane_with_cwd(10, 1, 1, "file:///tmp/repos/nerve_center"),
+            pane_with_cwd(20, 2, 1, "file:///tmp/repos/alpha"),
+            pane_with_cwd(30, 3, 1, "file:///tmp/repos/alpha"),
+        ]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        let result = app.apply(AppAction::AttachProjectAgent, &mut wezterm);
+
+        unsafe {
+            env::remove_var("NERVE_CENTER_DATA_DIR");
+        }
+        result.expect("attach should succeed");
+
+        assert_eq!(app.attached_pane_id, Some(30));
+        assert!(app.input_line().contains("oc:30[i]"));
+        assert_eq!(
+            wezterm.calls,
+            vec![
+                Call::ListPanes,
+                Call::ListPanes,
+                Call::SplitPane {
+                    host_pane_id: 10,
+                    move_pane_id: 30,
+                    direction: SplitDirection::Right,
+                },
+                Call::ActivatePane(10),
+                Call::ListPanes,
+            ]
+        );
+    }
+
+    #[test]
     fn attach_project_agent_starts_forwarding_and_escape_stops_it() {
         let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
         let state_dir = test_sandbox("attach-project-agent-forwarding");
@@ -2497,7 +2632,10 @@ exit 1
         }
         result.expect("attach should succeed");
         assert_eq!(app.mode, Mode::Forwarding);
-        assert!(app.input_line().contains("Forwarding keys to pane 20"));
+        assert!(
+            app.input_line()
+                .contains("Forwarding keys to cc:20[w] for alpha")
+        );
 
         app.apply(AppAction::Forward("i".to_string()), &mut wezterm)
             .expect("forward should succeed");
@@ -2523,6 +2661,70 @@ exit 1
                 },
             ]
         );
+    }
+
+    #[test]
+    fn forwarding_mode_switches_between_project_agents_without_wrapping() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let state_dir = test_sandbox("attach-project-agent-switches");
+        write_file(
+            &state_dir.join("20"),
+            r#"{"source":"claude","effective_state":"working"}"#,
+        );
+        write_file(
+            &state_dir.join("30"),
+            r#"{"runtime":"opencode","effective_state":"needs_input"}"#,
+        );
+        write_file(
+            &state_dir.join("40"),
+            r#"{"runtime":"opencode","effective_state":"done"}"#,
+        );
+        unsafe {
+            env::set_var("NERVE_CENTER_DATA_DIR", root_as_str(&state_dir));
+        }
+
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![
+            pane_with_cwd(10, 1, 1, "file:///tmp/repos/nerve_center"),
+            pane_with_cwd(20, 2, 1, "file:///tmp/repos/alpha"),
+            pane_with_cwd(30, 3, 1, "file:///tmp/repos/alpha"),
+            pane_with_cwd(40, 4, 1, "file:///tmp/repos/alpha"),
+        ]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        let result = (|| -> Result<()> {
+            app.apply(AppAction::AttachProjectAgent, &mut wezterm)?;
+            assert_eq!(app.attached_pane_id, Some(30));
+
+            app.apply(AppAction::SelectNextProjectAgent, &mut wezterm)?;
+            assert_eq!(app.attached_pane_id, Some(40));
+            assert!(app.input_line().contains("oc:40[d]"));
+
+            let call_count_at_right_edge = wezterm.calls.len();
+            app.apply(AppAction::SelectNextProjectAgent, &mut wezterm)?;
+            assert_eq!(app.attached_pane_id, Some(40));
+            assert_eq!(wezterm.calls.len(), call_count_at_right_edge);
+
+            app.apply(AppAction::SelectPreviousProjectAgent, &mut wezterm)?;
+            assert_eq!(app.attached_pane_id, Some(30));
+
+            app.apply(AppAction::SelectPreviousProjectAgent, &mut wezterm)?;
+            assert_eq!(app.attached_pane_id, Some(20));
+            assert!(app.input_line().contains("cc:20[w]"));
+
+            let call_count_at_left_edge = wezterm.calls.len();
+            app.apply(AppAction::SelectPreviousProjectAgent, &mut wezterm)?;
+            assert_eq!(app.attached_pane_id, Some(20));
+            assert_eq!(wezterm.calls.len(), call_count_at_left_edge);
+
+            Ok(())
+        })();
+
+        unsafe {
+            env::remove_var("NERVE_CENTER_DATA_DIR");
+        }
+        result.expect("agent switching should succeed");
     }
 
     #[test]
@@ -2979,9 +3181,11 @@ u UU N... 100644 100644 100644 100644 abcdef1 abcdef2 abcdef3 conflict.txt\n\
 
         let remove_error = run_git_worktree_remove(root_as_str(&root), root_as_str(&worktree))
             .expect_err("dirty worktree removal should fail");
-        assert!(remove_error
-            .to_string()
-            .contains("git worktree remove failed"));
+        assert!(
+            remove_error
+                .to_string()
+                .contains("git worktree remove failed")
+        );
 
         run_git_branch_delete(root_as_str(&root), "review")
             .expect_err("branch should still be checked out in dirty worktree");

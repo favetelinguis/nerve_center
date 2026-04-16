@@ -13,6 +13,8 @@ pub enum AppAction {
     OpenProjectIdea,
     OpenProjectTerminal,
     OpenProjectEditor,
+    SelectPreviousProjectAgent,
+    SelectNextProjectAgent,
     ExitForwarding,
     Forward(String),
     Quit,
@@ -55,6 +57,8 @@ pub fn action_for_key(
 fn forwarding_action(key: KeyEvent) -> Option<AppAction> {
     match key.code {
         KeyCode::Esc => Some(AppAction::ExitForwarding),
+        KeyCode::Left => Some(AppAction::SelectPreviousProjectAgent),
+        KeyCode::Right => Some(AppAction::SelectNextProjectAgent),
         KeyCode::Enter => Some(AppAction::Forward("\r".to_string())),
         KeyCode::Tab => Some(AppAction::Forward("\t".to_string())),
         KeyCode::Backspace => Some(AppAction::Forward("\u{7f}".to_string())),
@@ -188,6 +192,22 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)
             ),
             Some(AppAction::Forward("i".to_string()))
+        );
+        assert_eq!(
+            action_for_key(
+                false,
+                true,
+                KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)
+            ),
+            Some(AppAction::SelectPreviousProjectAgent)
+        );
+        assert_eq!(
+            action_for_key(
+                false,
+                true,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)
+            ),
+            Some(AppAction::SelectNextProjectAgent)
         );
         assert_eq!(
             action_for_key(
