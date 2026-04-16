@@ -2,6 +2,24 @@
 
 `nerve_center` shows a list of projects and panes in a terminal UI.
 
+## Releases
+
+Release artifacts are built with `cargo-dist` by GitHub Actions when you push a
+version tag such as `v0.1.0`.
+
+The generated release workflow publishes downloadable archives for:
+
+- Linux: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`
+- macOS: `x86_64-apple-darwin`, `aarch64-apple-darwin`
+- Windows: `x86_64-pc-windows-msvc`
+
+Typical release flow:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
 ## Hook Installation
 
 Install Claude Code hooks:
