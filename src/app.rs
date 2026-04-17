@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -201,6 +201,10 @@ pub struct App {
     attached_pane_id: Option<u64>,
     mode: Mode,
     input_mode: Option<InputMode>,
+    follow_mode: bool,
+    follow_queue: VecDeque<u64>,
+    follow_pending_handoff_from_pane_id: Option<u64>,
+    last_monitor_states: BTreeMap<u64, AgentMonitorState>,
     status_message: String,
     last_error: Option<String>,
     should_quit: bool,
@@ -241,6 +245,10 @@ impl App {
             attached_pane_id: None,
             mode: Mode::Normal,
             input_mode: None,
+            follow_mode: false,
+            follow_queue: VecDeque::new(),
+            follow_pending_handoff_from_pane_id: None,
+            last_monitor_states: BTreeMap::new(),
             status_message: String::new(),
             last_error: None,
             should_quit: false,
@@ -286,6 +294,14 @@ impl App {
         self.mode == Mode::Forwarding
     }
 
+    pub fn is_follow_mode(&self) -> bool {
+        self.follow_mode
+    }
+
+    pub fn follow_queue_len(&self) -> usize {
+        self.follow_queue.len()
+    }
+
     pub fn is_search_active(&self) -> bool {
         matches!(self.input_mode, Some(InputMode::Search { .. }))
     }
@@ -295,7 +311,10 @@ impl App {
     }
 
     pub fn tick<W: WeztermClient>(&mut self, wezterm: &mut W) -> Result<()> {
-        self.refresh(wezterm)
+        self.refresh(wezterm)?;
+        self.reconcile_follow_mode(wezterm)?;
+        self.last_monitor_states = self.monitor_states_by_pane_id();
+        Ok(())
     }
 
     pub fn status_line(&self) -> String {
@@ -324,18 +343,42 @@ impl App {
                         .unwrap_or("-");
                     let monitor =
                         self.project_agent_monitors(project_index)[agent_index].display_text();
-                    format!(
-                        "Forwarding keys to {monitor} for {project_name} (Left/Right to switch, Esc to return)"
-                    )
+                    if self.follow_mode {
+                        format!(
+                            "Follow mode: forwarding to {monitor} for {project_name} (Esc stops forwarding, Ctrl-f turns follow off)"
+                        )
+                    } else {
+                        format!(
+                            "Forwarding keys to {monitor} for {project_name} (Left/Right to switch, Esc to return)"
+                        )
+                    }
                 }
                 None => match self.attached_pane_id {
                     Some(pane_id) => {
-                        format!("Forwarding keys to pane {pane_id} (Esc to return)")
+                        if self.follow_mode {
+                            format!(
+                                "Follow mode: forwarding to pane {pane_id} (Esc stops forwarding, Ctrl-f turns follow off)"
+                            )
+                        } else {
+                            format!("Forwarding keys to pane {pane_id} (Esc to return)")
+                        }
                     }
-                    None => ": command on selected project, e.g. wt add <branch>".to_string(),
+                    None => {
+                        if self.follow_mode {
+                            "Follow mode is active globally (Ctrl-f to turn it off)".to_string()
+                        } else {
+                            ": command on selected project, e.g. wt add <branch>".to_string()
+                        }
+                    }
                 },
             },
-            None => ": command on selected project, e.g. wt add <branch>".to_string(),
+            None => {
+                if self.follow_mode {
+                    "Follow mode is active globally (Ctrl-f to turn it off)".to_string()
+                } else {
+                    ": command on selected project, e.g. wt add <branch>".to_string()
+                }
+            }
         }
     }
 
@@ -399,6 +442,7 @@ impl App {
             }
             AppAction::AcceptCommandCompletion => self.accept_command_completion(),
             AppAction::AttachProjectAgent => self.attach_project_agent(wezterm),
+            AppAction::ToggleFollowMode => self.toggle_follow_mode(wezterm),
             AppAction::OpenProjectIdea => self.open_project_idea(),
             AppAction::OpenProjectTerminal => {
                 self.open_project_in_other_pane(wezterm, SpawnCommand::shell())
@@ -1032,6 +1076,16 @@ impl App {
         project_index: usize,
         agent_index: usize,
     ) -> Result<()> {
+        self.attach_project_agent_at_index_with_status(wezterm, project_index, agent_index, false)
+    }
+
+    fn attach_project_agent_at_index_with_status<W: WeztermClient>(
+        &mut self,
+        wezterm: &mut W,
+        project_index: usize,
+        agent_index: usize,
+        from_follow_mode: bool,
+    ) -> Result<()> {
         let project = match self.projects.get(project_index) {
             Some(project) => project.clone(),
             None => {
@@ -1053,10 +1107,17 @@ impl App {
             return Ok(());
         }
         self.mode = Mode::Forwarding;
-        self.set_status(format!(
-            "Attached {monitor_label} for {} and forwarding keys",
-            project.name
-        ));
+        if from_follow_mode {
+            self.set_status(format!(
+                "Follow attached {monitor_label} for {}",
+                project.name
+            ));
+        } else {
+            self.set_status(format!(
+                "Attached {monitor_label} for {} and forwarding keys",
+                project.name
+            ));
+        }
         Ok(())
     }
 
@@ -1115,6 +1176,139 @@ impl App {
         }
 
         self.attach_project_agent_at_index(wezterm, project_index, target_agent_index)
+    }
+
+    fn toggle_follow_mode<W: WeztermClient>(&mut self, wezterm: &mut W) -> Result<()> {
+        self.follow_mode = !self.follow_mode;
+        self.follow_pending_handoff_from_pane_id = None;
+        self.follow_queue.clear();
+
+        if !self.follow_mode {
+            self.set_status("Follow mode OFF");
+            return Ok(());
+        }
+
+        self.refresh(wezterm)?;
+        self.seed_follow_queue_from_current_monitors();
+        self.reconcile_follow_mode(wezterm)?;
+        self.last_monitor_states = self.monitor_states_by_pane_id();
+        if self.attached_pane_id.is_some() {
+            return Ok(());
+        }
+        self.set_status("Follow mode ON");
+        Ok(())
+    }
+
+    fn seed_follow_queue_from_current_monitors(&mut self) {
+        self.follow_queue.clear();
+        for (project_index, agent_index) in self.all_agent_positions() {
+            let monitor = &self.project_agent_monitors[project_index][agent_index];
+            if monitor.state == AgentMonitorState::NeedsInput {
+                self.follow_queue.push_back(monitor.pane_id);
+            }
+        }
+    }
+
+    fn reconcile_follow_mode<W: WeztermClient>(&mut self, wezterm: &mut W) -> Result<()> {
+        if !self.follow_mode {
+            return Ok(());
+        }
+
+        let current_states = self.monitor_states_by_pane_id();
+        self.prune_follow_queue(&current_states);
+        self.enqueue_new_follow_candidates();
+
+        if let Some(pane_id) = self.attached_pane_id {
+            if current_states.get(&pane_id) == Some(&AgentMonitorState::NeedsInput) {
+                self.follow_queue.retain(|queued| *queued != pane_id);
+                self.follow_queue.push_front(pane_id);
+            }
+        }
+
+        if let Some(pane_id) = self.follow_pending_handoff_from_pane_id {
+            if current_states.get(&pane_id) == Some(&AgentMonitorState::NeedsInput) {
+                return Ok(());
+            }
+            self.follow_pending_handoff_from_pane_id = None;
+            self.follow_queue.retain(|queued| *queued != pane_id);
+        }
+
+        if matches!(
+            self.attached_pane_id
+                .and_then(|pane_id| current_states.get(&pane_id)),
+            Some(AgentMonitorState::NeedsInput)
+        ) {
+            return Ok(());
+        }
+
+        let Some(next_pane_id) = self.follow_queue.front().copied() else {
+            return Ok(());
+        };
+        if self.attached_pane_id == Some(next_pane_id) {
+            return Ok(());
+        }
+        let Some((project_index, agent_index)) = self.agent_position_by_pane_id(next_pane_id)
+        else {
+            self.follow_queue.pop_front();
+            return Ok(());
+        };
+
+        self.attach_project_agent_at_index_with_status(wezterm, project_index, agent_index, true)
+    }
+
+    fn prune_follow_queue(&mut self, current_states: &BTreeMap<u64, AgentMonitorState>) {
+        self.follow_queue
+            .retain(|pane_id| current_states.get(pane_id) == Some(&AgentMonitorState::NeedsInput));
+    }
+
+    fn enqueue_new_follow_candidates(&mut self) {
+        for (project_index, agent_index) in self.all_agent_positions() {
+            let monitor = &self.project_agent_monitors[project_index][agent_index];
+            if monitor.state != AgentMonitorState::NeedsInput {
+                continue;
+            }
+            if self.last_monitor_states.get(&monitor.pane_id)
+                == Some(&AgentMonitorState::NeedsInput)
+            {
+                continue;
+            }
+            if self.follow_queue.contains(&monitor.pane_id) {
+                continue;
+            }
+            self.follow_queue.push_back(monitor.pane_id);
+        }
+    }
+
+    fn all_agent_positions(&self) -> Vec<(usize, usize)> {
+        let mut positions = Vec::new();
+        for (project_index, monitors) in self.project_agent_monitors.iter().enumerate() {
+            for agent_index in 0..monitors.len() {
+                positions.push((project_index, agent_index));
+            }
+        }
+        positions
+    }
+
+    fn agent_position_by_pane_id(&self, pane_id: u64) -> Option<(usize, usize)> {
+        self.project_agent_monitors
+            .iter()
+            .enumerate()
+            .find_map(|(project_index, monitors)| {
+                monitors
+                    .iter()
+                    .position(|monitor| monitor.pane_id == pane_id)
+                    .map(|agent_index| (project_index, agent_index))
+            })
+    }
+
+    fn monitor_states_by_pane_id(&self) -> BTreeMap<u64, AgentMonitorState> {
+        let mut states = BTreeMap::new();
+        for monitors in &self.project_agent_monitors {
+            for monitor in monitors {
+                states.insert(monitor.pane_id, monitor.state);
+            }
+        }
+        states
     }
 
     fn attach_pane_into_tui<W: WeztermClient>(
@@ -1208,6 +1402,12 @@ impl App {
             .attached_pane_id
             .ok_or_else(|| anyhow!("cannot forward keys without an attached pane"))?;
         wezterm.send_text(attached_pane_id, text)?;
+        if self.follow_mode
+            && self.monitor_states_by_pane_id().get(&attached_pane_id)
+                == Some(&AgentMonitorState::NeedsInput)
+        {
+            self.follow_pending_handoff_from_pane_id = Some(attached_pane_id);
+        }
         self.last_error = None;
         Ok(())
     }
@@ -3270,6 +3470,130 @@ exit 1
                 .contains("Start an agent for this project first")
         );
         assert_eq!(wezterm.calls, vec![Call::ListPanes]);
+    }
+
+    #[test]
+    fn toggle_follow_mode_updates_global_indicator() {
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        app.apply(AppAction::ToggleFollowMode, &mut wezterm)
+            .expect("follow mode should enable");
+
+        assert!(app.is_follow_mode());
+        assert_eq!(app.follow_queue_len(), 0);
+        assert!(app.input_line().contains("Follow mode is active globally"));
+        assert!(app.status_line().contains("Follow mode ON"));
+
+        app.apply(AppAction::ToggleFollowMode, &mut wezterm)
+            .expect("follow mode should disable");
+
+        assert!(!app.is_follow_mode());
+        assert!(app.status_line().contains("Follow mode OFF"));
+    }
+
+    #[test]
+    fn follow_mode_attaches_global_needs_input_agent() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let state_dir = test_sandbox("follow-mode-global-attach");
+        write_file(
+            &state_dir.join("20"),
+            r#"{"source":"claude","effective_state":"working"}"#,
+        );
+        write_file(
+            &state_dir.join("30"),
+            r#"{"runtime":"opencode","effective_state":"needs_input"}"#,
+        );
+        unsafe {
+            env::set_var("NERVE_CENTER_DATA_DIR", root_as_str(&state_dir));
+        }
+
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![
+            pane_with_cwd(10, 1, 1, "file:///tmp/repos/nerve_center"),
+            pane_with_cwd(20, 2, 1, "file:///tmp/repos/alpha"),
+            pane_with_cwd(30, 3, 1, "file:///tmp/repos/beta"),
+        ]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        let result = app.apply(AppAction::ToggleFollowMode, &mut wezterm);
+
+        unsafe {
+            env::remove_var("NERVE_CENTER_DATA_DIR");
+        }
+        result.expect("follow mode should attach the global needs-input agent");
+
+        assert!(app.is_follow_mode());
+        assert_eq!(app.attached_pane_id, Some(30));
+        assert_eq!(app.follow_queue_len(), 1);
+        assert!(
+            app.input_line()
+                .contains("Follow mode: forwarding to oc:30[i] for beta")
+        );
+        assert!(
+            app.status_line()
+                .contains("Follow attached oc:30[i] for beta")
+        );
+    }
+
+    #[test]
+    fn follow_mode_advances_to_next_waiting_agent_after_input() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let state_dir = test_sandbox("follow-mode-advances");
+        write_file(
+            &state_dir.join("20"),
+            r#"{"source":"claude","effective_state":"needs_input"}"#,
+        );
+        write_file(
+            &state_dir.join("30"),
+            r#"{"runtime":"opencode","effective_state":"needs_input"}"#,
+        );
+        unsafe {
+            env::set_var("NERVE_CENTER_DATA_DIR", root_as_str(&state_dir));
+        }
+
+        set_wezterm_pane();
+        let snapshot = vec![
+            pane_with_cwd(10, 1, 1, "file:///tmp/repos/nerve_center"),
+            pane_with_cwd(20, 2, 1, "file:///tmp/repos/alpha"),
+            pane_with_cwd(30, 3, 1, "file:///tmp/repos/beta"),
+        ];
+        let mut wezterm = FakeWezterm::new(vec![snapshot.clone(), snapshot.clone(), snapshot]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        let result = (|| -> Result<()> {
+            app.apply(AppAction::ToggleFollowMode, &mut wezterm)?;
+            assert_eq!(app.attached_pane_id, Some(20));
+            assert_eq!(app.follow_queue_len(), 2);
+
+            app.apply(AppAction::Forward("answer".to_string()), &mut wezterm)?;
+            write_file(
+                &state_dir.join("20"),
+                r#"{"source":"claude","effective_state":"working"}"#,
+            );
+            app.tick(&mut wezterm)?;
+
+            assert_eq!(app.attached_pane_id, Some(30));
+            assert_eq!(app.follow_queue_len(), 1);
+            assert!(
+                app.status_line()
+                    .contains("Follow attached oc:30[i] for beta")
+            );
+
+            app.apply(AppAction::ExitForwarding, &mut wezterm)?;
+            assert!(app.is_follow_mode());
+            assert!(!app.is_forwarding());
+            Ok(())
+        })();
+
+        unsafe {
+            env::remove_var("NERVE_CENTER_DATA_DIR");
+        }
+        result.expect("follow mode should advance to the next waiting agent");
     }
 
     #[test]

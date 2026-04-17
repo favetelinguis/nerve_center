@@ -16,6 +16,7 @@ pub enum AppAction {
     PreviousCommandCompletion,
     AcceptCommandCompletion,
     AttachProjectAgent,
+    ToggleFollowMode,
     OpenProjectIdea,
     OpenProjectTerminal,
     OpenProjectEditor,
@@ -48,6 +49,10 @@ pub fn action_for_key(
         return forwarding_action(key);
     }
 
+    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('f') {
+        return Some(AppAction::ToggleFollowMode);
+    }
+
     if key.modifiers != KeyModifiers::NONE {
         return None;
     }
@@ -68,6 +73,9 @@ pub fn action_for_key(
 
 fn forwarding_action(key: KeyEvent) -> Option<AppAction> {
     match key.code {
+        KeyCode::Char('f') if key.modifiers == KeyModifiers::CONTROL => {
+            Some(AppAction::ToggleFollowMode)
+        }
         KeyCode::Esc => Some(AppAction::ExitForwarding),
         KeyCode::Left => Some(AppAction::SelectPreviousProjectAgent),
         KeyCode::Right => Some(AppAction::SelectNextProjectAgent),
@@ -188,6 +196,15 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)
             ),
             Some(AppAction::OpenProjectEditor)
+        );
+        assert_eq!(
+            action_for_key(
+                false,
+                false,
+                false,
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)
+            ),
+            Some(AppAction::ToggleFollowMode)
         );
         assert_eq!(
             action_for_key(
@@ -335,6 +352,15 @@ mod tests {
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
             ),
             Some(AppAction::Forward("\r".to_string()))
+        );
+        assert_eq!(
+            action_for_key(
+                false,
+                false,
+                true,
+                KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)
+            ),
+            Some(AppAction::ToggleFollowMode)
         );
         assert_eq!(
             action_for_key(

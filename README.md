@@ -38,7 +38,8 @@ Optional tools used by specific features:
 2. Move through projects with `j` and `k`.
 3. Press `:` to enter a project command and browse the `Completions` pane.
 4. Use `i` to attach the selected project's preferred running agent.
-5. Press `Esc` to stop forwarding keys back to the attached pane.
+5. Use `Ctrl-f` to toggle global follow mode for all running agents.
+6. Press `Esc` to stop forwarding keys back to the attached pane.
 
 When multiple agents are running for the selected project, `i` prefers the first agent that currently needs input. While forwarding is active, use `Left` and `Right` to switch to the previous or next running agent for that same project. Switching stops at the first and last agent; it does not wrap.
 
@@ -78,6 +79,7 @@ nerve_center doctor
 - `k`: move selection up
 - `:`: open project command input for the selected project
 - `i`: attach the selected project's preferred running agent into the side pane and start forwarding mode
+- `Ctrl-f`: toggle global follow mode on or off
 - `o`: open the selected project with `idea <project-path>`
 - `t`: open a shell for the selected project in the side pane without refocusing the TUI
 - `e`: open `nvim` for the selected project in the current TUI pane and return when `nvim` exits
@@ -102,9 +104,21 @@ Forwarding mode starts after a successful `i` attach.
 - `Enter`: forwarded to the attached pane
 - `Tab`: forwarded to the attached pane
 - `Backspace`: forwarded to the attached pane
+- `Ctrl-f`: toggle global follow mode on or off
 - `Left`: switch to the previous running agent for the attached project
 - `Right`: switch to the next running agent for the attached project
 - `Esc`: stop forwarding keys and return to normal mode
+
+## Follow Mode
+
+- `Ctrl-f` toggles a global follow mode for all running monitored agents
+- when follow mode is on, the input pane title shows `Follow [ON ...]`
+- follow mode watches all agent panes for `needs input`
+- when an agent enters `needs input`, it is queued globally
+- while you answer the current agent, follow mode waits for that pane to leave `needs input`
+- then it automatically attaches the next queued agent that still needs input
+- `Esc` stops forwarding only; it does not turn follow mode off
+- press `Ctrl-f` again to turn follow mode off
 
 ## Project Commands
 
@@ -115,7 +129,6 @@ Completions are hierarchical and context-aware:
 - `:` starts with top-level commands such as `agent`, `wt`, and `git`
 - `wt ` shows only valid worktree subcommands for the selected project kind
 - `wt add ` shows `[branch-name]`
-- `git ` appears only on root projects and currently offers `switch`
 - `git ` appears only on root projects and currently offers `switch` and `pull`
 - `git switch ` loads local and remote-tracking branch completions from the selected root repository, with local branches listed first
 - if a project command fails, the status pane shows the error message
@@ -232,8 +245,9 @@ Notes:
 3. Start an agent with `:agent claude` or `:agent opencode`.
 4. Install hooks if you want live agent state in the project list.
 5. Press `i` to attach the agent when it is time to interact with it.
-6. Use `Left` and `Right` in forwarding mode if that project has multiple running agents.
-7. Use `:wt add`, `:wt merge`, `:wt pr`, `:wt land`, or `:wt remove` to manage worktrees from the same UI.
+6. Press `Ctrl-f` if you want `nerve_center` to keep surfacing the next agent that needs input across all running agents.
+7. Use `Left` and `Right` in forwarding mode if that project has multiple running agents.
+8. Use `:wt add`, `:wt merge`, `:wt pr`, `:wt land`, or `:wt remove` to manage worktrees from the same UI.
 
 ## Releases
 

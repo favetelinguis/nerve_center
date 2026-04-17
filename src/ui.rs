@@ -2,7 +2,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
-use ratatui::{Frame, symbols};
+use ratatui::{symbols, Frame};
 
 use crate::app::App;
 
@@ -27,21 +27,32 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 fn render_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let follow_indicator = if app.is_follow_mode() {
+        format!("Follow [ON q={}] | ", app.follow_queue_len())
+    } else {
+        String::new()
+    };
     let title = if app.is_search_active() {
-        "Search [ACTIVE]".to_string()
+        format!("{follow_indicator}Search [ACTIVE]")
     } else if app.is_command_active() {
         format!(
-            "Command [ACTIVE] {}",
+            "{follow_indicator}Command [ACTIVE] {}",
             app.selected_project_name().unwrap_or("-")
         )
+    } else if app.is_forwarding() {
+        format!("{follow_indicator}Forwarding [ACTIVE]")
     } else if app.is_input_active() {
-        "Input [ACTIVE]".to_string()
+        format!("{follow_indicator}Input [ACTIVE]")
     } else {
-        "Input".to_string()
+        format!("{follow_indicator}Input")
     };
     let border_style = if app.is_search_active() {
-        Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        Style::default().add_modifier(Modifier::BOLD)
+    } else if app.is_follow_mode() && app.is_forwarding() {
+        Style::default().add_modifier(Modifier::BOLD)
     } else if app.is_command_active() {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else if app.is_follow_mode() {
         Style::default().add_modifier(Modifier::BOLD)
     } else if app.is_input_active() {
         Style::default().add_modifier(Modifier::BOLD)
