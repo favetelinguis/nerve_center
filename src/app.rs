@@ -5,14 +5,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::input::AppAction;
 use crate::wezterm::{
-    PaneInfo, SpawnCommand, SplitDirection, TuiTabLayout, WeztermClient, find_pane, listable_panes,
-    tui_pane_id_from_env, tui_tab_layout,
+    find_pane, listable_panes, tui_pane_id_from_env, tui_tab_layout, PaneInfo, SpawnCommand,
+    SplitDirection, TuiTabLayout, WeztermClient,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -90,6 +90,19 @@ impl ProjectStatusSummary {
         }
 
         parts.join(" ")
+    }
+}
+
+impl ProjectEntry {
+    pub fn list_label(&self) -> String {
+        match self.kind {
+            ProjectKind::Root => self.name.clone(),
+            ProjectKind::Worktree => format!("  |- {}", self.name),
+        }
+    }
+
+    fn search_label(&self) -> &str {
+        self.name.as_str()
     }
 }
 
@@ -193,7 +206,13 @@ impl ProjectAgentMonitor {
 
 #[derive(Debug, Clone)]
 enum InputMode {
-    Command { command: String },
+    Command {
+        command: String,
+    },
+    Search {
+        query: String,
+        restore_cwd: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,6 +325,10 @@ impl App {
         self.mode == Mode::Forwarding
     }
 
+    pub fn is_search_active(&self) -> bool {
+        matches!(self.input_mode, Some(InputMode::Search { .. }))
+    }
+
     pub fn should_quit(&self) -> bool {
         self.should_quit
     }
@@ -335,6 +358,7 @@ impl App {
                     .map(|project| project.name.as_str())
                     .unwrap_or("-")
             ),
+            Some(InputMode::Search { query, .. }) => format!("Search projects: /{query}"),
             None if self.mode == Mode::Forwarding => match self.attached_project_agent_position() {
                 Some((project_index, agent_index)) => {
                     let project_name = self
@@ -377,6 +401,10 @@ impl App {
                 self.start_command_input();
                 Ok(())
             }
+            AppAction::StartSearchInput => {
+                self.start_search_input();
+                Ok(())
+            }
             AppAction::ConfirmInput => self.confirm_input(wezterm),
             AppAction::CancelInput => {
                 self.cancel_input();
@@ -388,6 +416,14 @@ impl App {
             }
             AppAction::DeleteInputChar => {
                 self.delete_input_char();
+                Ok(())
+            }
+            AppAction::NextSearchMatch => {
+                self.advance_search_match(1);
+                Ok(())
+            }
+            AppAction::PreviousSearchMatch => {
+                self.advance_search_match(-1);
                 Ok(())
             }
             AppAction::AttachProjectAgent => self.attach_project_agent(wezterm),
@@ -463,18 +499,35 @@ impl App {
         self.set_status("Command input");
     }
 
+    fn start_search_input(&mut self) {
+        self.input_mode = Some(InputMode::Search {
+            query: String::new(),
+            restore_cwd: self.selected_project().map(|project| project.cwd.clone()),
+        });
+        self.set_status("Search projects");
+    }
+
     fn edit_input(&mut self, c: char) {
+        let mut refresh_search = false;
         let Some(input_mode) = self.input_mode.as_mut() else {
             return;
         };
 
         match input_mode {
             InputMode::Command { command } => command.push(c),
+            InputMode::Search { query, .. } => {
+                query.push(c);
+                refresh_search = true;
+            }
         }
         self.last_error = None;
+        if refresh_search {
+            self.refresh_search_selection();
+        }
     }
 
     fn delete_input_char(&mut self) {
+        let mut refresh_search = false;
         let Some(input_mode) = self.input_mode.as_mut() else {
             return;
         };
@@ -483,13 +536,28 @@ impl App {
             InputMode::Command { command } => {
                 command.pop();
             }
+            InputMode::Search { query, .. } => {
+                query.pop();
+                refresh_search = true;
+            }
         }
         self.last_error = None;
+        if refresh_search {
+            self.refresh_search_selection();
+        }
     }
 
     fn cancel_input(&mut self) {
-        self.input_mode = None;
-        self.set_status("Cancelled input");
+        match self.input_mode.take() {
+            Some(InputMode::Search { restore_cwd, .. }) => {
+                self.restore_search_selection(restore_cwd.as_deref());
+                self.set_status("Cancelled search");
+            }
+            Some(InputMode::Command { .. }) => {
+                self.set_status("Cancelled input");
+            }
+            None => {}
+        }
     }
 
     fn confirm_input<W: WeztermClient>(&mut self, wezterm: &mut W) -> Result<()> {
@@ -502,7 +570,119 @@ impl App {
                 self.input_mode = None;
                 self.execute_project_command(&command, wezterm)
             }
+            InputMode::Search { .. } => {
+                self.input_mode = None;
+                self.set_status("Selected project from search");
+                Ok(())
+            }
         }
+    }
+
+    fn refresh_search_selection(&mut self) {
+        let Some((query, restore_cwd)) = self.search_state() else {
+            return;
+        };
+        if query.trim().is_empty() {
+            self.restore_search_selection(restore_cwd.as_deref());
+            self.last_error = None;
+            return;
+        }
+
+        let matches = self.search_match_indices(&query);
+        if matches.is_empty() {
+            self.record_error(format!("No projects match /{query}"));
+            return;
+        }
+        if matches.contains(&self.selected_project_index) {
+            self.last_error = None;
+            return;
+        }
+
+        let restore_index = restore_cwd
+            .as_deref()
+            .and_then(|cwd| self.project_index_by_cwd(cwd))
+            .unwrap_or(0);
+        let target = matches
+            .iter()
+            .copied()
+            .find(|index| *index >= restore_index)
+            .unwrap_or(matches[0]);
+        self.selected_project_index = target;
+        self.last_error = None;
+    }
+
+    fn advance_search_match(&mut self, offset: isize) {
+        let Some((query, restore_cwd)) = self.search_state() else {
+            return;
+        };
+        if query.trim().is_empty() {
+            return;
+        }
+
+        let matches = self.search_match_indices(&query);
+        if matches.is_empty() {
+            self.record_error(format!("No projects match /{query}"));
+            return;
+        }
+
+        let current_position = matches
+            .iter()
+            .position(|index| *index == self.selected_project_index)
+            .or_else(|| {
+                let restore_index = restore_cwd
+                    .as_deref()
+                    .and_then(|cwd| self.project_index_by_cwd(cwd))
+                    .unwrap_or(0);
+                matches.iter().position(|index| *index >= restore_index)
+            })
+            .unwrap_or(0);
+        let target_position = if offset.is_negative() {
+            current_position.checked_sub(1).unwrap_or(matches.len() - 1)
+        } else {
+            (current_position + 1) % matches.len()
+        };
+
+        self.selected_project_index = matches[target_position];
+        self.last_error = None;
+    }
+
+    fn search_state(&self) -> Option<(String, Option<String>)> {
+        match self.input_mode.as_ref() {
+            Some(InputMode::Search { query, restore_cwd }) => {
+                Some((query.clone(), restore_cwd.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    fn search_match_indices(&self, query: &str) -> Vec<usize> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Vec::new();
+        }
+
+        let query = query.to_lowercase();
+        self.projects
+            .iter()
+            .enumerate()
+            .filter_map(|(index, project)| {
+                project
+                    .search_label()
+                    .to_lowercase()
+                    .contains(&query)
+                    .then_some(index)
+            })
+            .collect()
+    }
+
+    fn restore_search_selection(&mut self, restore_cwd: Option<&str>) {
+        if let Some(index) = restore_cwd.and_then(|cwd| self.project_index_by_cwd(cwd)) {
+            self.selected_project_index = index;
+        }
+    }
+
+    fn project_index_by_cwd(&self, cwd: &str) -> Option<usize> {
+        self.projects.iter().position(|project| project.cwd == cwd)
     }
 
     fn add_selected_worktree<W: WeztermClient>(
@@ -1911,9 +2091,9 @@ mod tests {
     use anyhow::Result;
 
     use super::{
-        App, GitProjectProbe, Mode, ProjectEntry, ProjectKind, ProjectStatusSummary,
         build_project_entries, parse_project_command, parse_project_status_output,
-        run_git_branch_delete, run_git_worktree_remove,
+        run_git_branch_delete, run_git_worktree_remove, App, GitProjectProbe, Mode, ProjectEntry,
+        ProjectKind, ProjectStatusSummary,
     };
     use crate::input::AppAction;
     use crate::wezterm::{PaneInfo, SpawnCommand, SplitDirection, WeztermClient};
@@ -2111,6 +2291,56 @@ mod tests {
         ]
     }
 
+    fn search_test_projects() -> Vec<ProjectEntry> {
+        vec![
+            ProjectEntry {
+                name: "alpha".to_string(),
+                cwd: "/tmp/repos/alpha".to_string(),
+                branch: "main".to_string(),
+                status_summary: ProjectStatusSummary::default(),
+                root_name: "alpha".to_string(),
+                root_cwd: "/tmp/repos/alpha".to_string(),
+                kind: ProjectKind::Root,
+            },
+            ProjectEntry {
+                name: "beta".to_string(),
+                cwd: "/tmp/repos/beta".to_string(),
+                branch: "feature/root-branch".to_string(),
+                status_summary: ProjectStatusSummary::default(),
+                root_name: "beta".to_string(),
+                root_cwd: "/tmp/repos/beta".to_string(),
+                kind: ProjectKind::Root,
+            },
+            ProjectEntry {
+                name: "repo".to_string(),
+                cwd: "/tmp/repos/repo".to_string(),
+                branch: "main".to_string(),
+                status_summary: ProjectStatusSummary::default(),
+                root_name: "repo".to_string(),
+                root_cwd: "/tmp/repos/repo".to_string(),
+                kind: ProjectKind::Root,
+            },
+            ProjectEntry {
+                name: "feature/build".to_string(),
+                cwd: "/tmp/repos/repo.feature-build".to_string(),
+                branch: "feature/build".to_string(),
+                status_summary: ProjectStatusSummary::default(),
+                root_name: "repo".to_string(),
+                root_cwd: "/tmp/repos/repo".to_string(),
+                kind: ProjectKind::Worktree,
+            },
+            ProjectEntry {
+                name: "feature/search".to_string(),
+                cwd: "/tmp/repos/repo.feature-search".to_string(),
+                branch: "feature/search".to_string(),
+                status_summary: ProjectStatusSummary::default(),
+                root_name: "repo".to_string(),
+                root_cwd: "/tmp/repos/repo".to_string(),
+                kind: ProjectKind::Worktree,
+            },
+        ]
+    }
+
     fn pane(pane_id: u64, tab_id: u64, window_id: u64) -> PaneInfo {
         PaneInfo {
             window_id,
@@ -2196,6 +2426,74 @@ mod tests {
     }
 
     #[test]
+    fn search_mode_selects_matching_projects_and_ignores_branch_column() {
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, search_test_projects()).expect("app should load");
+
+        app.apply(AppAction::StartSearchInput, &mut wezterm)
+            .expect("search input should start");
+        for c in "feature".chars() {
+            app.apply(AppAction::EditInput(c), &mut wezterm)
+                .expect("search should accept text");
+        }
+
+        assert!(app.is_search_active());
+        assert_eq!(app.selected_project_name(), Some("feature/build"));
+    }
+
+    #[test]
+    fn search_mode_cycles_matches_and_escape_restores_selection() {
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, search_test_projects()).expect("app should load");
+
+        app.apply(AppAction::StartSearchInput, &mut wezterm)
+            .expect("search input should start");
+        for c in "feature".chars() {
+            app.apply(AppAction::EditInput(c), &mut wezterm)
+                .expect("search should accept text");
+        }
+        app.apply(AppAction::NextSearchMatch, &mut wezterm)
+            .expect("next match should succeed");
+        assert_eq!(app.selected_project_name(), Some("feature/search"));
+
+        app.apply(AppAction::PreviousSearchMatch, &mut wezterm)
+            .expect("previous match should succeed");
+        assert_eq!(app.selected_project_name(), Some("feature/build"));
+
+        app.apply(AppAction::CancelInput, &mut wezterm)
+            .expect("cancel search should succeed");
+        assert!(!app.is_search_active());
+        assert_eq!(app.selected_project_name(), Some("alpha"));
+    }
+
+    #[test]
+    fn search_mode_enter_keeps_selected_match() {
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, search_test_projects()).expect("app should load");
+
+        app.apply(AppAction::StartSearchInput, &mut wezterm)
+            .expect("search input should start");
+        for c in "search".chars() {
+            app.apply(AppAction::EditInput(c), &mut wezterm)
+                .expect("search should accept text");
+        }
+
+        assert_eq!(app.selected_project_name(), Some("feature/search"));
+
+        app.apply(AppAction::ConfirmInput, &mut wezterm)
+            .expect("confirm search should succeed");
+
+        assert!(!app.is_search_active());
+        assert_eq!(app.selected_project_name(), Some("feature/search"));
+    }
+
+    #[test]
     fn remove_command_rejects_root_projects() {
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
@@ -2212,11 +2510,9 @@ mod tests {
         let error = app
             .apply(AppAction::ConfirmInput, &mut wezterm)
             .expect_err("root remove should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("remove only works on linked worktrees")
-        );
+        assert!(error
+            .to_string()
+            .contains("remove only works on linked worktrees"));
     }
 
     #[test]
@@ -2311,11 +2607,9 @@ mod tests {
         let created = &app.projects()[app.selected_project_index()];
         assert_eq!(created.branch, "feature/BOOST-3432");
         assert_eq!(created.name, "feature/BOOST-3432");
-        assert!(
-            created
-                .cwd
-                .starts_with(&format!("{}/wt-", sandbox.display()))
-        );
+        assert!(created
+            .cwd
+            .starts_with(&format!("{}/wt-", sandbox.display())));
     }
 
     #[test]
@@ -2354,11 +2648,9 @@ mod tests {
 
         let error = super::load_repo_sources_from_config_at(&config_path, &home)
             .expect_err("missing repo source should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("configured repo source does not exist")
-        );
+        assert!(error
+            .to_string()
+            .contains("configured repo source does not exist"));
     }
 
     #[test]
@@ -2495,10 +2787,9 @@ exit 1
         result.expect("pr should succeed");
 
         assert!(remote_branch_exists(&fixture.remote, "feature"));
-        assert!(
-            app.status_line()
-                .contains("PR ready for feature -> main: https://example.com/pr/123")
-        );
+        assert!(app
+            .status_line()
+            .contains("PR ready for feature -> main: https://example.com/pr/123"));
     }
 
     #[test]
@@ -2511,10 +2802,9 @@ exit 1
         app.apply(AppAction::AttachProjectAgent, &mut wezterm)
             .expect("attach should not error");
 
-        assert!(
-            app.status_line()
-                .contains("Start an agent for this project first")
-        );
+        assert!(app
+            .status_line()
+            .contains("Start an agent for this project first"));
         assert_eq!(wezterm.calls, vec![Call::ListPanes]);
     }
 
@@ -2639,10 +2929,9 @@ exit 1
         }
         result.expect("attach should succeed");
         assert_eq!(app.mode, Mode::Forwarding);
-        assert!(
-            app.input_line()
-                .contains("Forwarding keys to cc:20[w] for alpha")
-        );
+        assert!(app
+            .input_line()
+            .contains("Forwarding keys to cc:20[w] for alpha"));
 
         app.apply(AppAction::Forward("i".to_string()), &mut wezterm)
             .expect("forward should succeed");
@@ -3170,11 +3459,9 @@ u UU N... 100644 100644 100644 100644 abcdef1 abcdef2 abcdef3 conflict.txt\n\
 
         let remove_error = run_git_worktree_remove(root_as_str(&root), root_as_str(&worktree))
             .expect_err("dirty worktree removal should fail");
-        assert!(
-            remove_error
-                .to_string()
-                .contains("git worktree remove failed")
-        );
+        assert!(remove_error
+            .to_string()
+            .contains("git worktree remove failed"));
 
         run_git_branch_delete(root_as_str(&root), "review")
             .expect_err("branch should still be checked out in dirty worktree");

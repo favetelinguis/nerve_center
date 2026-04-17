@@ -2,18 +2,18 @@ use std::io::{self, Stdout, Write};
 use std::process::Command;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use crossterm::event::{self, Event};
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
 use url::Url;
 
 use crate::app::App;
-use crate::input::{AppAction, action_for_key};
+use crate::input::{action_for_key, AppAction};
 use crate::ui;
 use crate::wezterm::WeztermClient;
 
@@ -45,7 +45,12 @@ fn run_loop<W: WeztermClient>(
         }
 
         if let Event::Key(key) = event::read()? {
-            if let Some(action) = action_for_key(app.is_input_active(), app.is_forwarding(), key) {
+            if let Some(action) = action_for_key(
+                app.is_input_active(),
+                app.is_search_active(),
+                app.is_forwarding(),
+                key,
+            ) {
                 let selected_cwd_before = app.selected_project_cwd().map(str::to_string);
                 let open_editor = action == AppAction::OpenProjectEditor;
                 if let Err(error) = app.apply(action, wezterm) {

@@ -5,10 +5,13 @@ pub enum AppAction {
     ProjectMoveUp,
     ProjectMoveDown,
     StartCommandInput,
+    StartSearchInput,
     ConfirmInput,
     CancelInput,
     EditInput(char),
     DeleteInputChar,
+    NextSearchMatch,
+    PreviousSearchMatch,
     AttachProjectAgent,
     OpenProjectIdea,
     OpenProjectTerminal,
@@ -22,6 +25,7 @@ pub enum AppAction {
 
 pub fn action_for_key(
     input_active: bool,
+    search_active: bool,
     forwarding_active: bool,
     key: KeyEvent,
 ) -> Option<AppAction> {
@@ -30,7 +34,11 @@ pub fn action_for_key(
     }
 
     if input_active {
-        return input_action(key);
+        return if search_active {
+            search_input_action(key)
+        } else {
+            input_action(key)
+        };
     }
 
     if forwarding_active {
@@ -43,6 +51,7 @@ pub fn action_for_key(
 
     match key.code {
         KeyCode::Char(':') => Some(AppAction::StartCommandInput),
+        KeyCode::Char('/') => Some(AppAction::StartSearchInput),
         KeyCode::Char('j') => Some(AppAction::ProjectMoveDown),
         KeyCode::Char('k') => Some(AppAction::ProjectMoveUp),
         KeyCode::Char('i') => Some(AppAction::AttachProjectAgent),
@@ -81,16 +90,35 @@ fn input_action(key: KeyEvent) -> Option<AppAction> {
     }
 }
 
+fn search_input_action(key: KeyEvent) -> Option<AppAction> {
+    match key.code {
+        KeyCode::Esc => Some(AppAction::CancelInput),
+        KeyCode::Enter => Some(AppAction::ConfirmInput),
+        KeyCode::Backspace => Some(AppAction::DeleteInputChar),
+        KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
+            Some(AppAction::NextSearchMatch)
+        }
+        KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+            Some(AppAction::PreviousSearchMatch)
+        }
+        KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+            Some(AppAction::EditInput(c))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use super::{AppAction, action_for_key};
+    use super::{action_for_key, AppAction};
 
     #[test]
     fn project_mode_maps_navigation_and_actions() {
         assert_eq!(
             action_for_key(
+                false,
                 false,
                 false,
                 KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE)
@@ -101,12 +129,14 @@ mod tests {
             action_for_key(
                 false,
                 false,
+                false,
                 KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)
             ),
             Some(AppAction::ProjectMoveDown)
         );
         assert_eq!(
             action_for_key(
+                false,
                 false,
                 false,
                 KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)
@@ -117,12 +147,14 @@ mod tests {
             action_for_key(
                 false,
                 false,
+                false,
                 KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)
             ),
             Some(AppAction::AttachProjectAgent)
         );
         assert_eq!(
             action_for_key(
+                false,
                 false,
                 false,
                 KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)
@@ -133,12 +165,14 @@ mod tests {
             action_for_key(
                 false,
                 false,
+                false,
                 KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE)
             ),
             Some(AppAction::OpenProjectTerminal)
         );
         assert_eq!(
             action_for_key(
+                false,
                 false,
                 false,
                 KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE)
@@ -149,9 +183,19 @@ mod tests {
             action_for_key(
                 false,
                 false,
+                false,
                 KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)
             ),
             None
+        );
+        assert_eq!(
+            action_for_key(
+                false,
+                false,
+                false,
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE)
+            ),
+            Some(AppAction::StartSearchInput)
         );
     }
 
@@ -161,6 +205,7 @@ mod tests {
             action_for_key(
                 true,
                 false,
+                false,
                 KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
             ),
             Some(AppAction::EditInput('x'))
@@ -168,6 +213,7 @@ mod tests {
         assert_eq!(
             action_for_key(
                 true,
+                false,
                 false,
                 KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)
             ),
@@ -177,6 +223,7 @@ mod tests {
             action_for_key(
                 true,
                 false,
+                false,
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
             ),
             Some(AppAction::ConfirmInput)
@@ -184,9 +231,41 @@ mod tests {
     }
 
     #[test]
+    fn search_mode_maps_search_navigation_keys() {
+        assert_eq!(
+            action_for_key(
+                true,
+                true,
+                false,
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)
+            ),
+            Some(AppAction::NextSearchMatch)
+        );
+        assert_eq!(
+            action_for_key(
+                true,
+                true,
+                false,
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)
+            ),
+            Some(AppAction::PreviousSearchMatch)
+        );
+        assert_eq!(
+            action_for_key(
+                true,
+                true,
+                false,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ),
+            Some(AppAction::CancelInput)
+        );
+    }
+
+    #[test]
     fn forwarding_mode_maps_to_forward_and_escape() {
         assert_eq!(
             action_for_key(
+                false,
                 false,
                 true,
                 KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE)
@@ -196,6 +275,7 @@ mod tests {
         assert_eq!(
             action_for_key(
                 false,
+                false,
                 true,
                 KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)
             ),
@@ -203,6 +283,7 @@ mod tests {
         );
         assert_eq!(
             action_for_key(
+                false,
                 false,
                 true,
                 KeyEvent::new(KeyCode::Right, KeyModifiers::NONE)
@@ -212,13 +293,19 @@ mod tests {
         assert_eq!(
             action_for_key(
                 false,
+                false,
                 true,
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
             ),
             Some(AppAction::Forward("\r".to_string()))
         );
         assert_eq!(
-            action_for_key(false, true, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            action_for_key(
+                false,
+                false,
+                true,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ),
             Some(AppAction::ExitForwarding)
         );
     }
