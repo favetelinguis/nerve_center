@@ -1,7 +1,11 @@
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -12,6 +16,11 @@ use crate::cli::InternalCommands;
 
 const CLAUDE_COMMAND_NAME: &str = "internal ingest-claude-hook";
 const OPENCODE_SUBCOMMAND_NAME: &str = "ingest-opencode-event";
+const LOCK_STALE_AFTER_MS: u64 = 30_000;
+const LOCK_RETRY_DELAY_MS: u64 = 10;
+const LOCK_RETRY_LIMIT: usize = 500;
+
+static TMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct PaneAgentState {
@@ -65,8 +74,8 @@ impl PaneAgentState {
 }
 
 pub fn install_claude_hooks() -> Result<()> {
-    let binary = current_executable_string()?;
     let settings_path = claude_settings_path()?;
+    let binary = current_executable_string()?;
     install_claude_hooks_at(&settings_path, &binary)
 }
 
@@ -74,17 +83,15 @@ fn install_claude_hooks_at(settings_path: &Path, binary: &str) -> Result<()> {
     ensure_parent_dir(&settings_path)?;
 
     let mut root = read_json_object_or_empty(&settings_path)?;
+    remove_installed_claude_hooks(&mut root)?;
     let hooks = root
         .entry("hooks")
         .or_insert_with(|| Value::Object(Default::default()));
     let hook_command = format!("\"{binary}\" {CLAUDE_COMMAND_NAME}");
 
     ensure_claude_event_hook(hooks, "UserPromptSubmit", None, &hook_command)?;
-    ensure_claude_event_hook(hooks, "PreToolUse", None, &hook_command)?;
     ensure_claude_event_hook(hooks, "Stop", None, &hook_command)?;
     ensure_claude_event_hook(hooks, "StopFailure", None, &hook_command)?;
-    ensure_claude_event_hook(hooks, "SubagentStart", None, &hook_command)?;
-    ensure_claude_event_hook(hooks, "SubagentStop", None, &hook_command)?;
     ensure_claude_event_hook(
         hooks,
         "Notification",
@@ -97,13 +104,32 @@ fn install_claude_hooks_at(settings_path: &Path, binary: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn remove_claude_hooks() -> Result<()> {
+    let settings_path = claude_settings_path()?;
+    remove_claude_hooks_at(&settings_path)
+}
+
+fn remove_claude_hooks_at(settings_path: &Path) -> Result<()> {
+    if !settings_path.exists() {
+        println!("No Claude hooks found at {}", settings_path.display());
+        return Ok(());
+    }
+
+    let mut root = read_json_object_or_empty(settings_path)?;
+    remove_installed_claude_hooks(&mut root)?;
+    write_json_pretty(settings_path, &root.into())?;
+    println!("Removed Claude hooks from {}", settings_path.display());
+    Ok(())
+}
+
 pub fn install_opencode_hooks() -> Result<()> {
-    let binary = current_executable_string()?;
     let plugin_path = opencode_plugin_path()?;
+    let binary = current_executable_string()?;
     install_opencode_hooks_at(&plugin_path, &binary)
 }
 
 fn install_opencode_hooks_at(plugin_path: &Path, binary: &str) -> Result<()> {
+    remove_opencode_hooks_at(plugin_path)?;
     ensure_parent_dir(&plugin_path)?;
 
     let plugin = r#"const BINARY = __BINARY__;
@@ -125,13 +151,11 @@ export const NerveCenterPlugin = async (_ctx) => {
       if (!event || !event.type) {
         return
       }
-      switch (event.type) {
+        switch (event.type) {
         case "session.status": {
           const status = event.properties?.status?.type
           if (status === "busy" || status === "retry") {
             await sendState({ runtime: "opencode", state: "working", event_type: event.type })
-          } else if (status === "idle") {
-            await sendState({ runtime: "opencode", state: "done", event_type: event.type })
           }
           break
         }
@@ -141,7 +165,6 @@ export const NerveCenterPlugin = async (_ctx) => {
         case "session.error":
           await sendState({ runtime: "opencode", state: "error", event_type: event.type })
           break
-        case "permission.updated":
         case "permission.asked":
           await sendState({ runtime: "opencode", state: "needs_input", event_type: event.type })
           break
@@ -162,6 +185,27 @@ export const NerveCenterPlugin = async (_ctx) => {
         .with_context(|| format!("failed to write {}", plugin_path.display()))?;
     println!("Installed OpenCode plugin into {}", plugin_path.display());
     Ok(())
+}
+
+pub fn remove_opencode_hooks() -> Result<()> {
+    let plugin_path = opencode_plugin_path()?;
+    remove_opencode_hooks_at(&plugin_path)
+}
+
+fn remove_opencode_hooks_at(plugin_path: &Path) -> Result<()> {
+    match fs::remove_file(plugin_path) {
+        Ok(()) => {
+            println!("Removed OpenCode plugin from {}", plugin_path.display());
+            Ok(())
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            println!("No OpenCode plugin found at {}", plugin_path.display());
+            Ok(())
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to remove {}", plugin_path.display()))
+        }
+    }
 }
 
 pub fn run_internal(command: InternalCommands) -> Result<()> {
@@ -281,13 +325,15 @@ where
 {
     ensure_parent_dir(&path)?;
 
+    let _lock = PaneStateLock::acquire(path)?;
+
     let mut state = read_pane_state(&path)?.unwrap_or_else(|| PaneAgentState::new(pane_id, source));
     if state.source != source {
         state = PaneAgentState::new(pane_id, source);
     }
     mutate(&mut state);
 
-    let tmp_path = path.with_extension("tmp");
+    let tmp_path = unique_tmp_path(path);
     let content = serde_json::to_vec_pretty(&state).context("failed to serialize pane state")?;
     fs::write(&tmp_path, content)
         .with_context(|| format!("failed to write {}", tmp_path.display()))?;
@@ -414,6 +460,63 @@ fn ensure_claude_event_hook(
     Ok(())
 }
 
+fn remove_installed_claude_hooks(root: &mut serde_json::Map<String, Value>) -> Result<()> {
+    let Some(hooks) = root.get_mut("hooks") else {
+        return Ok(());
+    };
+
+    for event_name in [
+        "UserPromptSubmit",
+        "PreToolUse",
+        "Stop",
+        "StopFailure",
+        "SubagentStart",
+        "SubagentStop",
+        "Notification",
+    ] {
+        remove_claude_event_hooks_matching(hooks, event_name, is_installed_claude_hook_command)?;
+    }
+
+    if hooks.as_object().is_some_and(|hooks| hooks.is_empty()) {
+        root.remove("hooks");
+    }
+    Ok(())
+}
+
+fn remove_claude_event_hooks_matching(
+    hooks_value: &mut Value,
+    event_name: &str,
+    matches_command: fn(&str) -> bool,
+) -> Result<()> {
+    let hooks = hooks_value
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("Claude hooks config is not a JSON object"))?;
+    let Some(entry) = hooks.get_mut(event_name) else {
+        return Ok(());
+    };
+    let groups = entry
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("Claude hook event {event_name} is not an array"))?;
+
+    groups.retain_mut(|group| {
+        let Some(hooks) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+            return true;
+        };
+        hooks.retain(|hook| {
+            let Some(command) = hook.get("command").and_then(Value::as_str) else {
+                return true;
+            };
+            !matches_command(command)
+        });
+        !hooks.is_empty()
+    });
+
+    if groups.is_empty() {
+        hooks.remove(event_name);
+    }
+    Ok(())
+}
+
 fn group_matches(group: &Value, matcher: Option<&str>) -> bool {
     match (group.get("matcher").and_then(Value::as_str), matcher) {
         (None, None) => true,
@@ -431,10 +534,82 @@ fn group_contains_command(group: &Value, command: &str) -> bool {
         .any(|hook| hook.get("command").and_then(Value::as_str) == Some(command))
 }
 
+fn is_installed_claude_hook_command(command: &str) -> bool {
+    command.trim_end().ends_with(CLAUDE_COMMAND_NAME)
+}
+
 fn write_json_pretty(path: &Path, value: &Value) -> Result<()> {
     let content = serde_json::to_vec_pretty(value).context("failed to serialize JSON")?;
     fs::write(path, content).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
+}
+
+fn unique_tmp_path(path: &Path) -> PathBuf {
+    let suffix = TMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let extension = format!("tmp.{}.{}.{}", process::id(), now_unix_ms(), suffix);
+    path.with_extension(extension)
+}
+
+struct PaneStateLock {
+    path: PathBuf,
+}
+
+impl PaneStateLock {
+    fn acquire(state_path: &Path) -> Result<Self> {
+        let lock_path = state_path.with_extension("lock");
+
+        for _attempt in 0..LOCK_RETRY_LIMIT {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(_) => return Ok(Self { path: lock_path }),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                    if stale_lock_removed(&lock_path)? {
+                        continue;
+                    }
+                    thread::sleep(std::time::Duration::from_millis(LOCK_RETRY_DELAY_MS));
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("failed to acquire {}", lock_path.display()));
+                }
+            }
+        }
+
+        bail!("timed out waiting for {}", lock_path.display())
+    }
+}
+
+impl Drop for PaneStateLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn stale_lock_removed(lock_path: &Path) -> Result<bool> {
+    let Ok(metadata) = fs::metadata(lock_path) else {
+        return Ok(false);
+    };
+    let Ok(modified) = metadata.modified() else {
+        return Ok(false);
+    };
+    let age_ms = SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    if age_ms <= LOCK_STALE_AFTER_MS {
+        return Ok(false);
+    }
+
+    match fs::remove_file(lock_path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(true),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to remove stale {}", lock_path.display()))
+        }
+    }
 }
 
 fn now_unix_ms() -> u64 {
@@ -447,6 +622,8 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     fn test_dir(name: &str) -> PathBuf {
         let unique = now_unix_ms();
@@ -465,8 +642,115 @@ mod tests {
 
         let settings = fs::read_to_string(settings_path).expect("settings should be readable");
         assert!(settings.contains("UserPromptSubmit"));
+        assert!(settings.contains("StopFailure"));
         assert!(settings.contains("Notification"));
         assert!(settings.contains(CLAUDE_COMMAND_NAME));
+        assert!(!settings.contains("PreToolUse"));
+        assert!(!settings.contains("SubagentStart"));
+        assert!(!settings.contains("SubagentStop"));
+    }
+
+    #[test]
+    fn claude_installer_removes_old_working_hooks() {
+        let home = test_dir("claude-install-cleanup");
+        let settings_path = home.join(".claude/settings.json");
+        let old_command = "\"/tmp/old_nerve_center\" internal ingest-claude-hook";
+
+        ensure_parent_dir(&settings_path).expect("settings parent should be created");
+
+        write_json_pretty(
+            &settings_path,
+            &json!({
+                "hooks": {
+                    "UserPromptSubmit": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": old_command,
+                        }],
+                    }],
+                    "PreToolUse": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": old_command,
+                        }],
+                    }],
+                    "SubagentStart": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": old_command,
+                        }],
+                    }],
+                    "SubagentStop": [{
+                        "hooks": [{
+                            "type": "command",
+                            "command": old_command,
+                        }],
+                    }],
+                    "Notification": [{
+                        "matcher": "permission_prompt|elicitation_dialog",
+                        "hooks": [{
+                            "type": "command",
+                            "command": old_command,
+                        }],
+                    }],
+                },
+            }),
+        )
+        .expect("seed settings should be written");
+
+        install_claude_hooks_at(&settings_path, "/tmp/new_nerve_center")
+            .expect("claude install should succeed");
+
+        let settings = fs::read_to_string(settings_path).expect("settings should be readable");
+        assert!(settings.contains("/tmp/new_nerve_center"));
+        assert!(!settings.contains("/tmp/old_nerve_center"));
+        assert!(!settings.contains("PreToolUse"));
+        assert!(!settings.contains("SubagentStart"));
+        assert!(!settings.contains("SubagentStop"));
+    }
+
+    #[test]
+    fn claude_remover_clears_installed_hooks_but_keeps_other_hooks() {
+        let home = test_dir("claude-remove");
+        let settings_path = home.join(".claude/settings.json");
+
+        ensure_parent_dir(&settings_path).expect("settings parent should be created");
+
+        write_json_pretty(
+            &settings_path,
+            &json!({
+                "hooks": {
+                    "UserPromptSubmit": [{
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "\"/tmp/old_nerve_center\" internal ingest-claude-hook",
+                            },
+                            {
+                                "type": "command",
+                                "command": "printf keep-me",
+                            }
+                        ],
+                    }],
+                    "Notification": [{
+                        "matcher": "permission_prompt|elicitation_dialog",
+                        "hooks": [{
+                            "type": "command",
+                            "command": "\"/tmp/old_nerve_center\" internal ingest-claude-hook",
+                        }],
+                    }],
+                },
+                "theme": "dark",
+            }),
+        )
+        .expect("seed settings should be written");
+
+        remove_claude_hooks_at(&settings_path).expect("claude remove should succeed");
+
+        let settings = fs::read_to_string(settings_path).expect("settings should be readable");
+        assert!(!settings.contains(CLAUDE_COMMAND_NAME));
+        assert!(settings.contains("printf keep-me"));
+        assert!(settings.contains("theme"));
     }
 
     #[test]
@@ -479,7 +763,23 @@ mod tests {
 
         let plugin = fs::read_to_string(plugin_path).expect("plugin should be readable");
         assert!(plugin.contains(OPENCODE_SUBCOMMAND_NAME));
+        assert!(plugin.contains("session.idle"));
         assert!(plugin.contains("permission.replied"));
+        assert!(!plugin.contains("status === \"idle\""));
+        assert!(!plugin.contains("permission.updated"));
+    }
+
+    #[test]
+    fn opencode_remover_deletes_plugin_file() {
+        let home = test_dir("opencode-remove");
+        let plugin_path = home.join(".config/opencode/plugins/nerve_center.js");
+
+        ensure_parent_dir(&plugin_path).expect("plugin parent should be created");
+        fs::write(&plugin_path, "stale plugin").expect("plugin should be seeded");
+
+        remove_opencode_hooks_at(&plugin_path).expect("opencode remove should succeed");
+
+        assert!(!plugin_path.exists());
     }
 
     #[test]
@@ -496,5 +796,40 @@ mod tests {
         let state = fs::read_to_string(state_path).expect("pane file should exist");
         assert!(state.contains("\"source\": \"opencode\""));
         assert!(state.contains("\"effective_state\": \"working\""));
+    }
+
+    #[test]
+    fn concurrent_updates_share_a_single_consistent_state_file() {
+        let data_dir = test_dir("concurrent-state");
+        let state_path = data_dir.join("8");
+        let worker_count = 8;
+        let barrier = Arc::new(Barrier::new(worker_count));
+        let mut workers = Vec::new();
+
+        for _ in 0..worker_count {
+            let barrier = barrier.clone();
+            let state_path = state_path.clone();
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                update_pane_state_at_path(&state_path, 8, "claude", |state| {
+                    state.main_state = "working".to_string();
+                    state.subagent_count = state.subagent_count.saturating_add(1);
+                    state.touch("concurrent");
+                })
+            }));
+        }
+
+        for worker in workers {
+            worker
+                .join()
+                .expect("worker should not panic")
+                .expect("state update should succeed");
+        }
+
+        let state = read_pane_state(&state_path)
+            .expect("pane state should be readable")
+            .expect("pane state should exist");
+        assert_eq!(state.subagent_count, worker_count as u64);
+        assert_eq!(state.effective_state, "working");
     }
 }

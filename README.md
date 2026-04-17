@@ -133,13 +133,27 @@ Install Claude Code hooks:
 nerve_center --install-hooks-claude
 ```
 
+Remove Claude Code hooks that were previously installed by `nerve_center`:
+
+```sh
+nerve_center --remove-hooks-claude
+```
+
 Install the OpenCode plugin hook bridge:
 
 ```sh
 nerve_center --install-hooks-opencode
 ```
 
-These installers write agent state files to `~/.local/data/nerve_center/<wezterm-pane-id>` when the agent is working, done, errored, or waiting for user input.
+Remove the OpenCode plugin hook bridge installed by `nerve_center`:
+
+```sh
+nerve_center --remove-hooks-opencode
+```
+
+The install commands first remove any older `nerve_center` hook entries they can find, then install the current hook set for a clean update path.
+
+These commands write agent state files to `~/.local/data/nerve_center/<wezterm-pane-id>` when the agent is working, done, errored, or waiting for user input.
 
 There are also hidden internal subcommands used by those hook installers:
 

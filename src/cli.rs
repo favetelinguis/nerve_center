@@ -16,6 +16,12 @@ pub struct Cli {
     #[arg(long = "install-hooks-opencode")]
     pub install_hooks_opencode: bool,
 
+    #[arg(long = "remove-hooks-claude")]
+    pub remove_hooks_claude: bool,
+
+    #[arg(long = "remove-hooks-opencode")]
+    pub remove_hooks_opencode: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }

@@ -14,13 +14,23 @@ use wezterm::ProcessWezterm;
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
+    if cli.remove_hooks_claude {
+        hooks::remove_claude_hooks()?;
+    }
+    if cli.remove_hooks_opencode {
+        hooks::remove_opencode_hooks()?;
+    }
     if cli.install_hooks_claude {
         hooks::install_claude_hooks()?;
     }
     if cli.install_hooks_opencode {
         hooks::install_opencode_hooks()?;
     }
-    if cli.install_hooks_claude || cli.install_hooks_opencode {
+    if cli.remove_hooks_claude
+        || cli.remove_hooks_opencode
+        || cli.install_hooks_claude
+        || cli.install_hooks_opencode
+    {
         return Ok(());
     }
 
