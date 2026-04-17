@@ -36,7 +36,7 @@ Optional tools used by specific features:
 
 1. Run `nerve_center` inside a WezTerm pane.
 2. Move through projects with `j` and `k`.
-3. Press `:` to enter a project command.
+3. Press `:` to enter a project command and browse the `Completions` pane.
 4. Use `i` to attach the selected project's preferred running agent.
 5. Press `Esc` to stop forwarding keys back to the attached pane.
 
@@ -86,6 +86,10 @@ nerve_center doctor
 ### Command Input Mode
 
 - Type to enter a command
+- Context-aware completions appear in the `Completions` pane below the input pane
+- `Ctrl-n`: move to the next completion
+- `Ctrl-p`: move to the previous completion
+- `Tab`: insert the highlighted completion into the command line
 - `Enter`: run the command
 - `Backspace`: delete one character
 - `Esc`: cancel command input
@@ -106,10 +110,26 @@ Forwarding mode starts after a successful `i` attach.
 
 Press `:` and enter one of the following commands for the selected project.
 
+Completions are hierarchical and context-aware:
+
+- `:` starts with top-level commands such as `agent`, `wt`, and `git`
+- `wt ` shows only valid worktree subcommands for the selected project kind
+- `wt add ` shows `[branch-name]`
+- `git ` appears only on root projects and currently offers `switch`
+- `git ` appears only on root projects and currently offers `switch` and `pull`
+- `git switch ` loads local and remote-tracking branch completions from the selected root repository, with local branches listed first
+- if a project command fails, the status pane shows the error message
+
 ### Agent Commands
 
 - `agent claude`: open a new Claude tab rooted at the selected project
 - `agent opencode`: open a new OpenCode tab rooted at the selected project
+
+### Git Commands
+
+- `git switch <branchname>`: switch the selected root project to `<branchname>`
+- `git switch <remote>/<branchname>`: create and switch to a local tracking branch from a remote-tracking ref when needed
+- `git pull`: pull updates for the selected root project and refresh the UI
 
 ### Worktree Commands
 
@@ -121,6 +141,7 @@ Press `:` and enter one of the following commands for the selected project.
 
 Notes:
 
+- `git switch` is only available for root repositories.
 - `wt remove`, `wt merge`, `wt pr`, and `wt land` are intended for linked worktrees, not root repositories.
 - If `[target]` is omitted, `nerve_center` resolves a default branch for the repository, usually the remote default branch such as `main`.
 - `wt pr` requires `gh` and a configured git remote.

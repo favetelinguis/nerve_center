@@ -2,7 +2,7 @@ use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
-use ratatui::{symbols, Frame};
+use ratatui::{Frame, symbols};
 
 use crate::app::App;
 
@@ -12,28 +12,37 @@ pub fn render(frame: &mut Frame, app: &App) {
         .constraints([
             Constraint::Min(1),
             Constraint::Length(3),
+            Constraint::Length(7),
             Constraint::Length(3),
         ])
         .split(frame.area());
 
     render_projects(frame, app, layout[0]);
     render_input(frame, app, layout[1]);
+    render_completions(frame, app, layout[2]);
 
     let footer =
         Paragraph::new(Line::from(app.status_line())).block(Block::default().borders(Borders::ALL));
-    frame.render_widget(footer, layout[2]);
+    frame.render_widget(footer, layout[3]);
 }
 
 fn render_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let title = if app.is_search_active() {
-        "Search [ACTIVE]"
+        "Search [ACTIVE]".to_string()
+    } else if app.is_command_active() {
+        format!(
+            "Command [ACTIVE] {}",
+            app.selected_project_name().unwrap_or("-")
+        )
     } else if app.is_input_active() {
-        "Input [ACTIVE]"
+        "Input [ACTIVE]".to_string()
     } else {
-        "Input"
+        "Input".to_string()
     };
     let border_style = if app.is_search_active() {
         Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else if app.is_command_active() {
+        Style::default().add_modifier(Modifier::BOLD)
     } else if app.is_input_active() {
         Style::default().add_modifier(Modifier::BOLD)
     } else {
@@ -46,6 +55,40 @@ fn render_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             .title(title),
     );
     frame.render_widget(input, area);
+}
+
+fn render_completions(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let rows = if app.is_command_active() && !app.command_completions().is_empty() {
+        app.command_completions()
+            .iter()
+            .map(|completion| ListItem::new(completion.label.clone()))
+            .collect::<Vec<_>>()
+    } else if app.is_command_active() {
+        vec![ListItem::new("No command completions")]
+    } else {
+        vec![ListItem::new("")]
+    };
+
+    let border_style = if app.is_command_active() {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let list = List::new(rows)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .title("Completions"),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+        .highlight_symbol(symbols::DOT);
+
+    let mut list_state = ratatui::widgets::ListState::default();
+    if let Some(selected) = app.selected_command_completion_index() {
+        list_state.select(Some(selected));
+    }
+    frame.render_stateful_widget(list, area, &mut list_state);
 }
 
 fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {

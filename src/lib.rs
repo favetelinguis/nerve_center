@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod command;
 mod hooks;
 mod input;
 mod tui;

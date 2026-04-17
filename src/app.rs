@@ -5,14 +5,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::command::{
+    AgentRuntime, CommandCompletion, CommandContext, CommandProjectKind, CompletionState,
+    ProjectCommand, apply_completion, complete_command, parse_project_command,
+};
 use crate::input::AppAction;
 use crate::wezterm::{
-    find_pane, listable_panes, tui_pane_id_from_env, tui_tab_layout, PaneInfo, SpawnCommand,
-    SplitDirection, TuiTabLayout, WeztermClient,
+    PaneInfo, SpawnCommand, SplitDirection, TuiTabLayout, WeztermClient, find_pane, listable_panes,
+    tui_pane_id_from_env, tui_tab_layout,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -112,48 +116,6 @@ pub struct PaneRow {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentRuntime {
-    Claude,
-    OpenCode,
-}
-
-impl AgentRuntime {
-    fn parse_command(name: &str) -> Result<Self> {
-        match name {
-            "claude" | "claude-code" => Ok(Self::Claude),
-            "opencode" => Ok(Self::OpenCode),
-            _ => bail!("unknown agent runtime: {name}"),
-        }
-    }
-
-    fn from_state_name(name: &str) -> Option<Self> {
-        match name.trim().to_ascii_lowercase().as_str() {
-            "claude" | "claude-code" | "cc" => Some(Self::Claude),
-            "opencode" | "oc" => Some(Self::OpenCode),
-            _ => None,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::OpenCode => "opencode",
-        }
-    }
-
-    fn short_label(self) -> &'static str {
-        match self {
-            Self::Claude => "cc",
-            Self::OpenCode => "oc",
-        }
-    }
-
-    fn spawn_command(self) -> SpawnCommand {
-        SpawnCommand::new(self.label(), vec![self.label().to_string()])
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentMonitorState {
     Starting,
     Working,
@@ -204,25 +166,20 @@ impl ProjectAgentMonitor {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct CommandInputState {
+    command: String,
+    completions: Vec<CommandCompletion>,
+    selected_completion_index: usize,
+}
+
 #[derive(Debug, Clone)]
 enum InputMode {
-    Command {
-        command: String,
-    },
+    Command(CommandInputState),
     Search {
         query: String,
         restore_cwd: Option<String>,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ProjectCommand {
-    Add { branch: String },
-    Remove,
-    Merge { target: Option<String> },
-    Pr { target: Option<String> },
-    Land { target: Option<String> },
-    Agent { runtime: AgentRuntime },
 }
 
 const DEFAULT_REPO_SOURCE: &str = "~/repos";
@@ -321,6 +278,10 @@ impl App {
         self.input_mode.is_some()
     }
 
+    pub fn is_command_active(&self) -> bool {
+        matches!(self.input_mode, Some(InputMode::Command(_)))
+    }
+
     pub fn is_forwarding(&self) -> bool {
         self.mode == Mode::Forwarding
     }
@@ -352,13 +313,8 @@ impl App {
 
     pub fn input_line(&self) -> String {
         match self.input_mode.as_ref() {
-            Some(InputMode::Command { command }) => format!(
-                "Project command for {}: :{command}",
-                self.selected_project()
-                    .map(|project| project.name.as_str())
-                    .unwrap_or("-")
-            ),
-            Some(InputMode::Search { query, .. }) => format!("Search projects: /{query}"),
+            Some(InputMode::Command(command_state)) => format!(":{}", command_state.command),
+            Some(InputMode::Search { query, .. }) => format!("/{query}"),
             None if self.mode == Mode::Forwarding => match self.attached_project_agent_position() {
                 Some((project_index, agent_index)) => {
                     let project_name = self
@@ -387,6 +343,22 @@ impl App {
         self.last_error = Some(error.into());
     }
 
+    pub fn command_completions(&self) -> &[CommandCompletion] {
+        match self.input_mode.as_ref() {
+            Some(InputMode::Command(state)) => state.completions.as_slice(),
+            _ => &[],
+        }
+    }
+
+    pub fn selected_command_completion_index(&self) -> Option<usize> {
+        match self.input_mode.as_ref() {
+            Some(InputMode::Command(state)) if !state.completions.is_empty() => {
+                Some(state.selected_completion_index)
+            }
+            _ => None,
+        }
+    }
+
     pub fn apply<W: WeztermClient>(&mut self, action: AppAction, wezterm: &mut W) -> Result<()> {
         match action {
             AppAction::ProjectMoveUp => {
@@ -397,10 +369,7 @@ impl App {
                 self.project_move_down();
                 Ok(())
             }
-            AppAction::StartCommandInput => {
-                self.start_command_input();
-                Ok(())
-            }
+            AppAction::StartCommandInput => self.start_command_input(),
             AppAction::StartSearchInput => {
                 self.start_search_input();
                 Ok(())
@@ -410,14 +379,8 @@ impl App {
                 self.cancel_input();
                 Ok(())
             }
-            AppAction::EditInput(c) => {
-                self.edit_input(c);
-                Ok(())
-            }
-            AppAction::DeleteInputChar => {
-                self.delete_input_char();
-                Ok(())
-            }
+            AppAction::EditInput(c) => self.edit_input(c),
+            AppAction::DeleteInputChar => self.delete_input_char(),
             AppAction::NextSearchMatch => {
                 self.advance_search_match(1);
                 Ok(())
@@ -426,6 +389,15 @@ impl App {
                 self.advance_search_match(-1);
                 Ok(())
             }
+            AppAction::NextCommandCompletion => {
+                self.advance_command_completion(1);
+                Ok(())
+            }
+            AppAction::PreviousCommandCompletion => {
+                self.advance_command_completion(-1);
+                Ok(())
+            }
+            AppAction::AcceptCommandCompletion => self.accept_command_completion(),
             AppAction::AttachProjectAgent => self.attach_project_agent(wezterm),
             AppAction::OpenProjectIdea => self.open_project_idea(),
             AppAction::OpenProjectTerminal => {
@@ -492,11 +464,36 @@ impl App {
         }
     }
 
-    fn start_command_input(&mut self) {
-        self.input_mode = Some(InputMode::Command {
-            command: String::new(),
+    fn refresh_command_input_state(&mut self) -> Result<()> {
+        let context_kind = self.selected_project().map(|project| match project.kind {
+            ProjectKind::Root => CommandProjectKind::Root,
+            ProjectKind::Worktree => CommandProjectKind::Worktree,
         });
-        self.set_status("Command input");
+        let root_cwd = self
+            .selected_project()
+            .map(|project| project.root_cwd.clone());
+        let Some(InputMode::Command(state)) = self.input_mode.as_mut() else {
+            return Ok(());
+        };
+
+        let context = CommandContext {
+            project_kind: context_kind,
+            root_cwd: root_cwd.as_deref(),
+        };
+        let CompletionState { items } = complete_command(&state.command, &context)?;
+        state.completions = items;
+        if state.completions.is_empty() {
+            state.selected_completion_index = 0;
+        } else if state.selected_completion_index >= state.completions.len() {
+            state.selected_completion_index = state.completions.len() - 1;
+        }
+        Ok(())
+    }
+
+    fn start_command_input(&mut self) -> Result<()> {
+        self.input_mode = Some(InputMode::Command(CommandInputState::default()));
+        self.refresh_command_input_state()?;
+        Ok(())
     }
 
     fn start_search_input(&mut self) {
@@ -504,17 +501,16 @@ impl App {
             query: String::new(),
             restore_cwd: self.selected_project().map(|project| project.cwd.clone()),
         });
-        self.set_status("Search projects");
     }
 
-    fn edit_input(&mut self, c: char) {
+    fn edit_input(&mut self, c: char) -> Result<()> {
         let mut refresh_search = false;
         let Some(input_mode) = self.input_mode.as_mut() else {
-            return;
+            return Ok(());
         };
 
         match input_mode {
-            InputMode::Command { command } => command.push(c),
+            InputMode::Command(state) => state.command.push(c),
             InputMode::Search { query, .. } => {
                 query.push(c);
                 refresh_search = true;
@@ -523,18 +519,21 @@ impl App {
         self.last_error = None;
         if refresh_search {
             self.refresh_search_selection();
+        } else {
+            self.refresh_command_input_state()?;
         }
+        Ok(())
     }
 
-    fn delete_input_char(&mut self) {
+    fn delete_input_char(&mut self) -> Result<()> {
         let mut refresh_search = false;
         let Some(input_mode) = self.input_mode.as_mut() else {
-            return;
+            return Ok(());
         };
 
         match input_mode {
-            InputMode::Command { command } => {
-                command.pop();
+            InputMode::Command(state) => {
+                state.command.pop();
             }
             InputMode::Search { query, .. } => {
                 query.pop();
@@ -544,7 +543,10 @@ impl App {
         self.last_error = None;
         if refresh_search {
             self.refresh_search_selection();
+        } else {
+            self.refresh_command_input_state()?;
         }
+        Ok(())
     }
 
     fn cancel_input(&mut self) {
@@ -553,7 +555,7 @@ impl App {
                 self.restore_search_selection(restore_cwd.as_deref());
                 self.set_status("Cancelled search");
             }
-            Some(InputMode::Command { .. }) => {
+            Some(InputMode::Command(_)) => {
                 self.set_status("Cancelled input");
             }
             None => {}
@@ -566,16 +568,58 @@ impl App {
         };
 
         match input_mode {
-            InputMode::Command { command } => {
-                self.input_mode = None;
-                self.execute_project_command(&command, wezterm)
-            }
+            InputMode::Command(_) => self.confirm_command_input(wezterm),
             InputMode::Search { .. } => {
                 self.input_mode = None;
                 self.set_status("Selected project from search");
                 Ok(())
             }
         }
+    }
+
+    fn confirm_command_input<W: WeztermClient>(&mut self, wezterm: &mut W) -> Result<()> {
+        if self.try_apply_selected_command_completion_on_confirm()? {
+            let command = self.command_text().unwrap_or_default().trim().to_string();
+            if parse_project_command(&command).is_err() {
+                return Ok(());
+            }
+        }
+
+        let Some(command) = self.command_text().map(str::to_string) else {
+            return Ok(());
+        };
+        self.input_mode = None;
+        self.execute_project_command(&command, wezterm)
+    }
+
+    fn command_text(&self) -> Option<&str> {
+        match self.input_mode.as_ref() {
+            Some(InputMode::Command(state)) => Some(state.command.as_str()),
+            _ => None,
+        }
+    }
+
+    fn try_apply_selected_command_completion_on_confirm(&mut self) -> Result<bool> {
+        let Some(InputMode::Command(state)) = self.input_mode.as_ref() else {
+            return Ok(false);
+        };
+        let Some(completion) = state
+            .completions
+            .get(state.selected_completion_index)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        let Some(_) = completion.insert_text.as_deref() else {
+            return Ok(false);
+        };
+
+        if !should_apply_completion_on_confirm(state, &completion) {
+            return Ok(false);
+        }
+
+        self.accept_command_completion()?;
+        Ok(true)
     }
 
     fn refresh_search_selection(&mut self) {
@@ -726,7 +770,7 @@ impl App {
             return Ok(());
         }
 
-        match parse_project_command(command)? {
+        let result = match parse_project_command(command)? {
             ProjectCommand::Add { branch } => self.add_selected_worktree(&branch, wezterm),
             ProjectCommand::Remove => self.remove_selected_worktree(wezterm),
             ProjectCommand::Merge { target } => {
@@ -745,7 +789,52 @@ impl App {
                 self.open_project_agent_tab(wezterm, runtime)?;
                 Ok(())
             }
+            ProjectCommand::GitSwitch { branch } => {
+                self.switch_selected_root_branch(&branch, wezterm)
+            }
+            ProjectCommand::GitPull => self.pull_selected_root_project(wezterm),
+        };
+
+        if let Err(error) = &result {
+            self.record_error(error.to_string());
         }
+
+        result
+    }
+
+    fn advance_command_completion(&mut self, offset: isize) {
+        let Some(InputMode::Command(state)) = self.input_mode.as_mut() else {
+            return;
+        };
+        if state.completions.is_empty() {
+            return;
+        }
+
+        let count = state.completions.len();
+        state.selected_completion_index = if offset.is_negative() {
+            state
+                .selected_completion_index
+                .checked_sub(offset.unsigned_abs())
+                .unwrap_or(count - 1)
+        } else {
+            (state.selected_completion_index + offset as usize) % count
+        };
+    }
+
+    fn accept_command_completion(&mut self) -> Result<()> {
+        let Some(InputMode::Command(state)) = self.input_mode.as_mut() else {
+            return Ok(());
+        };
+        let Some(completion) = state
+            .completions
+            .get(state.selected_completion_index)
+            .cloned()
+        else {
+            return Ok(());
+        };
+
+        state.command = apply_completion(&state.command, &completion);
+        self.refresh_command_input_state()
     }
 
     fn selected_linked_worktree(&self) -> Result<ProjectEntry> {
@@ -762,6 +851,68 @@ impl App {
         }
 
         Ok(project)
+    }
+
+    fn selected_root_project(&self) -> Result<ProjectEntry> {
+        let project = self
+            .selected_project()
+            .cloned()
+            .ok_or_else(|| anyhow!("No projects found"))?;
+
+        if project.kind != ProjectKind::Root {
+            bail!("command only works on root projects");
+        }
+        if matches!(project.branch.as_str(), "DETACHED" | "N/A") {
+            bail!("command requires a branch-backed root project");
+        }
+
+        Ok(project)
+    }
+
+    fn switch_selected_root_branch<W: WeztermClient>(
+        &mut self,
+        branch: &str,
+        wezterm: &mut W,
+    ) -> Result<()> {
+        let project = self.selected_root_project().map_err(|error| {
+            if error
+                .to_string()
+                .contains("command only works on root projects")
+            {
+                anyhow!("git switch only works on root projects")
+            } else {
+                error
+            }
+        })?;
+        let branch = normalize_worktree_branch_input(branch)
+            .ok_or_else(|| anyhow!("git switch requires a branch name"))?;
+
+        switch_to_branch(&project.root_cwd, &branch)?;
+        self.sync_tui(wezterm, Some(&project.root_cwd))?;
+        self.set_status(format!("Switched {} to {branch}", project.name));
+        Ok(())
+    }
+
+    fn pull_selected_root_project<W: WeztermClient>(&mut self, wezterm: &mut W) -> Result<()> {
+        let project = self.selected_root_project().map_err(|error| {
+            if error
+                .to_string()
+                .contains("command only works on root projects")
+            {
+                anyhow!("git pull only works on root projects")
+            } else {
+                error
+            }
+        })?;
+
+        run_git(
+            &project.root_cwd,
+            &["pull"],
+            &format!("failed to pull updates for {}", project.root_cwd),
+        )?;
+        self.sync_tui(wezterm, Some(&project.root_cwd))?;
+        self.set_status(format!("Pulled updates for {}", project.name));
+        Ok(())
     }
 
     fn resolve_target_branch(
@@ -1090,7 +1241,6 @@ impl App {
     fn refresh<W: WeztermClient>(&mut self, wezterm: &mut W) -> Result<()> {
         let panes = wezterm.list_panes()?;
         self.replace_rows(panes)?;
-        self.last_error = None;
         Ok(())
     }
 
@@ -1682,75 +1832,6 @@ fn project_index_for_cwd(projects: &[ProjectEntry], cwd: &str) -> Option<usize> 
         .map(|(index, _)| index)
 }
 
-fn parse_project_command(command: &str) -> Result<ProjectCommand> {
-    let mut parts = command.split_whitespace();
-    let Some(name) = parts.next() else {
-        bail!("empty projects command")
-    };
-
-    match name {
-        "agent" => {
-            let runtime = parts
-                .next()
-                .ok_or_else(|| anyhow!("agent requires a runtime"))?;
-            if parts.next().is_some() {
-                bail!("too many arguments for projects command: {command}")
-            }
-            Ok(ProjectCommand::Agent {
-                runtime: AgentRuntime::parse_command(runtime)?,
-            })
-        }
-        "wt" => {
-            let Some(subcommand) = parts.next() else {
-                bail!("wt requires a subcommand")
-            };
-
-            match subcommand {
-                "add" => {
-                    let branch = parts
-                        .next()
-                        .ok_or_else(|| anyhow!("wt add requires a branch name"))?;
-                    if parts.next().is_some() {
-                        bail!("too many arguments for projects command: {command}")
-                    }
-                    Ok(ProjectCommand::Add {
-                        branch: branch.to_string(),
-                    })
-                }
-                "remove" => {
-                    if parts.next().is_some() {
-                        bail!("wt remove does not take a target branch")
-                    }
-                    Ok(ProjectCommand::Remove)
-                }
-                "merge" => {
-                    let target = parts.next().map(str::to_string);
-                    if parts.next().is_some() {
-                        bail!("too many arguments for projects command: {command}")
-                    }
-                    Ok(ProjectCommand::Merge { target })
-                }
-                "pr" => {
-                    let target = parts.next().map(str::to_string);
-                    if parts.next().is_some() {
-                        bail!("too many arguments for projects command: {command}")
-                    }
-                    Ok(ProjectCommand::Pr { target })
-                }
-                "land" => {
-                    let target = parts.next().map(str::to_string);
-                    if parts.next().is_some() {
-                        bail!("too many arguments for projects command: {command}")
-                    }
-                    Ok(ProjectCommand::Land { target })
-                }
-                _ => bail!("unknown worktree command: {command}"),
-            }
-        }
-        _ => bail!("unknown projects command: {command}"),
-    }
-}
-
 fn default_target_branch(root_cwd: &str, projects: &[ProjectEntry]) -> Result<String> {
     if let Some(branch) = remote_default_branch(root_cwd)? {
         return Ok(branch);
@@ -1838,11 +1919,72 @@ fn switch_to_branch(cwd: &str, branch: &str) -> Result<()> {
         return Ok(());
     }
 
+    if local_branch_exists(cwd, branch)? {
+        return run_git(
+            cwd,
+            &["switch", branch],
+            &format!("failed to switch {cwd} to {branch}"),
+        );
+    }
+
+    if let Some((remote, remote_branch)) = split_remote_branch(branch) {
+        if local_branch_exists(cwd, remote_branch)? {
+            return run_git(
+                cwd,
+                &["switch", remote_branch],
+                &format!("failed to switch {cwd} to {remote_branch}"),
+            );
+        }
+
+        if remote_tracking_ref_exists(cwd, remote, remote_branch)? {
+            return run_git(
+                cwd,
+                &["switch", "--track", "-c", remote_branch, branch],
+                &format!("failed to switch {cwd} to tracking branch {branch}"),
+            );
+        }
+    }
+
     run_git(
         cwd,
         &["switch", branch],
         &format!("failed to switch {cwd} to {branch}"),
     )
+}
+
+fn split_remote_branch(branch: &str) -> Option<(&str, &str)> {
+    let (remote, remote_branch) = branch.split_once('/')?;
+    (!remote.is_empty() && !remote_branch.is_empty()).then_some((remote, remote_branch))
+}
+
+fn should_apply_completion_on_confirm(
+    state: &CommandInputState,
+    completion: &CommandCompletion,
+) -> bool {
+    let Some(insert_text) = completion.insert_text.as_deref() else {
+        return false;
+    };
+    let current_token = current_command_token(&state.command);
+    if current_token == insert_text {
+        return false;
+    }
+    if current_token.is_empty() {
+        return true;
+    }
+
+    !state
+        .completions
+        .iter()
+        .filter_map(|item| item.insert_text.as_deref())
+        .any(|item| item == current_token)
+}
+
+fn current_command_token(command: &str) -> &str {
+    if command.ends_with(char::is_whitespace) {
+        return "";
+    }
+
+    command.split_whitespace().last().unwrap_or("")
 }
 
 fn branch_remote(cwd: &str, branch: &str) -> Result<Option<String>> {
@@ -2091,9 +2233,9 @@ mod tests {
     use anyhow::Result;
 
     use super::{
+        App, GitProjectProbe, Mode, ProjectEntry, ProjectKind, ProjectStatusSummary,
         build_project_entries, parse_project_command, parse_project_status_output,
-        run_git_branch_delete, run_git_worktree_remove, App, GitProjectProbe, Mode, ProjectEntry,
-        ProjectKind, ProjectStatusSummary,
+        run_git_branch_delete, run_git_worktree_remove,
     };
     use crate::input::AppAction;
     use crate::wezterm::{PaneInfo, SpawnCommand, SplitDirection, WeztermClient};
@@ -2422,7 +2564,158 @@ mod tests {
             .expect("input should accept text");
 
         assert!(app.is_input_active());
-        assert!(app.input_line().contains("Project command for alpha: :r"));
+        assert!(app.is_command_active());
+        assert_eq!(app.input_line(), ":r");
+        assert_eq!(app.command_completions().len(), 0);
+    }
+
+    #[test]
+    fn command_errors_persist_across_background_refresh() {
+        let sandbox = test_sandbox("command-error-status-persist");
+        let root = create_repo_in(&sandbox, "repo");
+        let projects = super::discover_projects_in(std::slice::from_ref(&sandbox))
+            .expect("projects should be discovered");
+
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app = App::load_with_projects(&mut wezterm, projects).expect("app should load");
+
+        let error = app
+            .execute_project_command("git switch missing-branch", &mut wezterm)
+            .expect_err("git switch should fail for a missing branch");
+        assert!(error.to_string().contains("failed to switch"));
+        assert!(app.status_line().contains("failed to switch"));
+        assert_eq!(
+            super::read_branch_name(&root).expect("branch should be readable"),
+            "main"
+        );
+
+        app.tick(&mut wezterm)
+            .expect("background refresh should succeed");
+
+        assert!(app.status_line().contains("failed to switch"));
+    }
+
+    #[test]
+    fn command_input_completions_are_context_aware_and_tab_applies_them() {
+        let fixture = create_worktree_fixture("command-completions-context");
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app = App::load_with_projects(&mut wezterm, fixture.projects.clone())
+            .expect("app should load");
+
+        app.apply(AppAction::StartCommandInput, &mut wezterm)
+            .expect("command input should start");
+        assert_eq!(
+            app.command_completions()
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agent", "wt", "git"]
+        );
+
+        app.apply(AppAction::EditInput('g'), &mut wezterm)
+            .expect("command input should accept text");
+        app.apply(AppAction::EditInput('i'), &mut wezterm)
+            .expect("command input should narrow top-level command");
+        app.apply(AppAction::AcceptCommandCompletion, &mut wezterm)
+            .expect("tab completion should apply top-level command");
+        app.apply(AppAction::EditInput('s'), &mut wezterm)
+            .expect("command input should accept text");
+        app.apply(AppAction::AcceptCommandCompletion, &mut wezterm)
+            .expect("tab completion should apply subcommand");
+
+        assert!(app.input_line().contains(":git switch "));
+
+        app.apply(AppAction::CancelInput, &mut wezterm)
+            .expect("command input should cancel");
+        app.apply(AppAction::ProjectMoveDown, &mut wezterm)
+            .expect("selection should move to worktree");
+
+        app.apply(AppAction::StartCommandInput, &mut wezterm)
+            .expect("command input should start for worktree");
+        assert_eq!(
+            app.command_completions()
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["agent", "wt"]
+        );
+        app.apply(AppAction::EditInput('w'), &mut wezterm)
+            .expect("command input should accept text");
+        app.apply(AppAction::EditInput('t'), &mut wezterm)
+            .expect("command input should accept text");
+        app.apply(AppAction::AcceptCommandCompletion, &mut wezterm)
+            .expect("tab completion should apply worktree command");
+
+        assert_eq!(
+            app.command_completions()
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["add", "remove", "merge", "pr", "land"]
+        );
+    }
+
+    #[test]
+    fn confirm_input_applies_selected_completion_before_executing() {
+        let sandbox = test_sandbox("confirm-input-applies-completion");
+        let root = create_repo_in(&sandbox, "repo");
+        git(&root, &["switch", "-c", "feature/confirm"]);
+        git(&root, &["switch", "main"]);
+        let projects = super::discover_projects_in(std::slice::from_ref(&sandbox))
+            .expect("projects should be discovered");
+
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app = App::load_with_projects(&mut wezterm, projects).expect("app should load");
+
+        app.apply(AppAction::StartCommandInput, &mut wezterm)
+            .expect("command input should start");
+        for c in "gi".chars() {
+            app.apply(AppAction::EditInput(c), &mut wezterm)
+                .expect("command should accept text");
+        }
+        app.apply(AppAction::ConfirmInput, &mut wezterm)
+            .expect("enter should apply top-level completion");
+        assert_eq!(app.input_line(), ":git ");
+
+        app.apply(AppAction::EditInput('s'), &mut wezterm)
+            .expect("command should accept text");
+        app.apply(AppAction::ConfirmInput, &mut wezterm)
+            .expect("enter should apply subcommand completion");
+        assert_eq!(app.input_line(), ":git switch ");
+
+        app.apply(AppAction::EditInput('c'), &mut wezterm)
+            .expect("command should accept text");
+        app.apply(AppAction::ConfirmInput, &mut wezterm)
+            .expect("enter should apply branch completion and execute");
+
+        assert!(!app.is_command_active());
+        assert_eq!(
+            super::read_branch_name(&root).expect("branch should be readable"),
+            "feature/confirm"
+        );
+    }
+
+    #[test]
+    fn command_completion_navigation_wraps_with_ctrl_n_and_ctrl_p() {
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        app.apply(AppAction::StartCommandInput, &mut wezterm)
+            .expect("command input should start");
+        assert_eq!(app.selected_command_completion_index(), Some(0));
+
+        app.apply(AppAction::PreviousCommandCompletion, &mut wezterm)
+            .expect("previous completion should wrap");
+        assert_eq!(app.selected_command_completion_index(), Some(2));
+
+        app.apply(AppAction::NextCommandCompletion, &mut wezterm)
+            .expect("next completion should wrap");
+        assert_eq!(app.selected_command_completion_index(), Some(0));
     }
 
     #[test]
@@ -2510,9 +2803,11 @@ mod tests {
         let error = app
             .apply(AppAction::ConfirmInput, &mut wezterm)
             .expect_err("root remove should fail");
-        assert!(error
-            .to_string()
-            .contains("remove only works on linked worktrees"));
+        assert!(
+            error
+                .to_string()
+                .contains("remove only works on linked worktrees")
+        );
     }
 
     #[test]
@@ -2553,12 +2848,175 @@ mod tests {
                 runtime: super::AgentRuntime::Claude,
             }
         );
+        assert_eq!(
+            parse_project_command("git switch feature/root-branch")
+                .expect("git switch should parse"),
+            super::ProjectCommand::GitSwitch {
+                branch: "feature/root-branch".to_string()
+            }
+        );
+        assert_eq!(
+            parse_project_command("git pull").expect("git pull should parse"),
+            super::ProjectCommand::GitPull
+        );
         assert!(parse_project_command("remove").is_err());
         assert!(parse_project_command("merge").is_err());
         assert!(parse_project_command("pr main").is_err());
         assert!(parse_project_command("land").is_err());
         assert!(parse_project_command("wt add").is_err());
         assert!(parse_project_command("wt remove main").is_err());
+        assert!(parse_project_command("git switch").is_err());
+    }
+
+    #[test]
+    fn git_switch_command_changes_selected_root_branch() {
+        let sandbox = test_sandbox("git-switch-root");
+        let root = create_repo_in(&sandbox, "repo");
+        git(&root, &["switch", "-c", "feature/switch-test"]);
+        git(&root, &["switch", "main"]);
+        let projects = super::discover_projects_in(std::slice::from_ref(&sandbox))
+            .expect("projects should be discovered");
+
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app = App::load_with_projects(&mut wezterm, projects).expect("app should load");
+
+        app.execute_project_command("git switch feature/switch-test", &mut wezterm)
+            .expect("git switch should succeed");
+
+        assert_eq!(
+            super::read_branch_name(&root).expect("branch should be readable"),
+            "feature/switch-test"
+        );
+        assert_eq!(
+            app.projects()[app.selected_project_index()].cwd,
+            root_as_str(&root)
+        );
+        assert!(
+            app.status_line()
+                .contains("Switched repo to feature/switch-test")
+        );
+    }
+
+    #[test]
+    fn git_switch_command_creates_local_tracking_branch_from_remote_ref() {
+        let sandbox = test_sandbox("git-switch-remote-ref");
+        let root = create_repo_in(&sandbox, "repo");
+        let remote = sandbox.join("origin.git");
+
+        git(&sandbox, &["init", "--bare", root_as_str(&remote)]);
+        git(&root, &["remote", "add", "origin", root_as_str(&remote)]);
+        git(&root, &["push", "-u", "origin", "main"]);
+        git(&root, &["switch", "-c", "feature/remote-only"]);
+        write_file(&root.join("remote.txt"), "remote\n");
+        git_commit_all(&root, "remote branch");
+        git(&root, &["push", "-u", "origin", "feature/remote-only"]);
+        git(&root, &["switch", "main"]);
+        git(&root, &["branch", "-D", "feature/remote-only"]);
+        git(&root, &["fetch", "origin"]);
+
+        let projects = super::discover_projects_in(std::slice::from_ref(&sandbox))
+            .expect("projects should be discovered");
+
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app = App::load_with_projects(&mut wezterm, projects).expect("app should load");
+
+        app.execute_project_command("git switch origin/feature/remote-only", &mut wezterm)
+            .expect("git switch should create tracking branch");
+
+        assert_eq!(
+            super::read_branch_name(&root).expect("branch should be readable"),
+            "feature/remote-only"
+        );
+        assert!(branch_exists(&root, "feature/remote-only"));
+        assert!(
+            app.status_line()
+                .contains("Switched repo to origin/feature/remote-only")
+        );
+    }
+
+    #[test]
+    fn git_pull_command_refreshes_selected_root_project() {
+        let sandbox = test_sandbox("git-pull-root");
+        let remote = sandbox.join("origin.git");
+        let peer_parent = sandbox.join("peer-parent");
+        fs::create_dir_all(&peer_parent).expect("peer parent should exist");
+
+        git(&sandbox, &["init", "--bare", root_as_str(&remote)]);
+        let root = create_repo_in(&sandbox, "repo");
+        git(&root, &["remote", "add", "origin", root_as_str(&remote)]);
+        git(&root, &["push", "-u", "origin", "main"]);
+
+        let peer = peer_parent.join("peer");
+        git(
+            &peer_parent,
+            &["clone", root_as_str(&remote), root_as_str(&peer)],
+        );
+        write_file(&peer.join("pulled.txt"), "updated\n");
+        git_commit_all(&peer, "peer update");
+        git(&peer, &["push", "origin", "main"]);
+
+        let projects = super::discover_projects_in(std::slice::from_ref(&sandbox))
+            .expect("projects should be discovered");
+
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app = App::load_with_projects(&mut wezterm, projects).expect("app should load");
+
+        app.execute_project_command("git pull", &mut wezterm)
+            .expect("git pull should succeed");
+
+        assert_eq!(head_message(&root), "peer update");
+        assert_eq!(
+            app.projects()[app.selected_project_index()].cwd,
+            root_as_str(&root)
+        );
+        assert!(app.status_line().contains("Pulled updates for repo"));
+    }
+
+    #[test]
+    fn git_switch_command_rejects_worktrees() {
+        let fixture = create_worktree_fixture("git-switch-worktree-reject");
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app = App::load_with_projects(&mut wezterm, fixture.projects.clone())
+            .expect("app should load");
+        app.apply(AppAction::ProjectMoveDown, &mut wezterm)
+            .expect("selection should move to worktree");
+
+        let error = app
+            .execute_project_command("git switch main", &mut wezterm)
+            .expect_err("git switch should reject worktrees");
+        assert!(
+            error
+                .to_string()
+                .contains("git switch only works on root projects")
+        );
+        assert!(
+            app.status_line()
+                .contains("git switch only works on root projects")
+        );
+    }
+
+    #[test]
+    fn git_switch_command_reports_failure_when_branch_is_checked_out_in_worktree() {
+        let fixture = create_worktree_fixture("git-switch-checked-out-elsewhere");
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
+        let mut app = App::load_with_projects(&mut wezterm, fixture.projects.clone())
+            .expect("app should load");
+
+        let error = app
+            .execute_project_command("git switch feature", &mut wezterm)
+            .expect_err("git switch should fail while branch is checked out in worktree");
+
+        assert!(error.to_string().contains("failed to switch"));
+        assert!(app.status_line().contains("failed to switch"));
+        assert_eq!(
+            super::read_branch_name(&fixture.root).expect("branch should be readable"),
+            "main"
+        );
     }
 
     #[test]
@@ -2607,9 +3065,11 @@ mod tests {
         let created = &app.projects()[app.selected_project_index()];
         assert_eq!(created.branch, "feature/BOOST-3432");
         assert_eq!(created.name, "feature/BOOST-3432");
-        assert!(created
-            .cwd
-            .starts_with(&format!("{}/wt-", sandbox.display())));
+        assert!(
+            created
+                .cwd
+                .starts_with(&format!("{}/wt-", sandbox.display()))
+        );
     }
 
     #[test]
@@ -2648,9 +3108,11 @@ mod tests {
 
         let error = super::load_repo_sources_from_config_at(&config_path, &home)
             .expect_err("missing repo source should fail");
-        assert!(error
-            .to_string()
-            .contains("configured repo source does not exist"));
+        assert!(
+            error
+                .to_string()
+                .contains("configured repo source does not exist")
+        );
     }
 
     #[test]
@@ -2787,9 +3249,10 @@ exit 1
         result.expect("pr should succeed");
 
         assert!(remote_branch_exists(&fixture.remote, "feature"));
-        assert!(app
-            .status_line()
-            .contains("PR ready for feature -> main: https://example.com/pr/123"));
+        assert!(
+            app.status_line()
+                .contains("PR ready for feature -> main: https://example.com/pr/123")
+        );
     }
 
     #[test]
@@ -2802,9 +3265,10 @@ exit 1
         app.apply(AppAction::AttachProjectAgent, &mut wezterm)
             .expect("attach should not error");
 
-        assert!(app
-            .status_line()
-            .contains("Start an agent for this project first"));
+        assert!(
+            app.status_line()
+                .contains("Start an agent for this project first")
+        );
         assert_eq!(wezterm.calls, vec![Call::ListPanes]);
     }
 
@@ -2929,9 +3393,10 @@ exit 1
         }
         result.expect("attach should succeed");
         assert_eq!(app.mode, Mode::Forwarding);
-        assert!(app
-            .input_line()
-            .contains("Forwarding keys to cc:20[w] for alpha"));
+        assert!(
+            app.input_line()
+                .contains("Forwarding keys to cc:20[w] for alpha")
+        );
 
         app.apply(AppAction::Forward("i".to_string()), &mut wezterm)
             .expect("forward should succeed");
@@ -3459,9 +3924,11 @@ u UU N... 100644 100644 100644 100644 abcdef1 abcdef2 abcdef3 conflict.txt\n\
 
         let remove_error = run_git_worktree_remove(root_as_str(&root), root_as_str(&worktree))
             .expect_err("dirty worktree removal should fail");
-        assert!(remove_error
-            .to_string()
-            .contains("git worktree remove failed"));
+        assert!(
+            remove_error
+                .to_string()
+                .contains("git worktree remove failed")
+        );
 
         run_git_branch_delete(root_as_str(&root), "review")
             .expect_err("branch should still be checked out in dirty worktree");

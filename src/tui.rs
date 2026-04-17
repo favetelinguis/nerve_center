@@ -2,18 +2,18 @@ use std::io::{self, Stdout, Write};
 use std::process::Command;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use crossterm::event::{self, Event};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use url::Url;
 
 use crate::app::App;
-use crate::input::{action_for_key, AppAction};
+use crate::input::{AppAction, action_for_key};
 use crate::ui;
 use crate::wezterm::WeztermClient;
 

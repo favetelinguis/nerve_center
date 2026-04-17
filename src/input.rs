@@ -12,6 +12,9 @@ pub enum AppAction {
     DeleteInputChar,
     NextSearchMatch,
     PreviousSearchMatch,
+    NextCommandCompletion,
+    PreviousCommandCompletion,
+    AcceptCommandCompletion,
     AttachProjectAgent,
     OpenProjectIdea,
     OpenProjectTerminal,
@@ -82,7 +85,14 @@ fn input_action(key: KeyEvent) -> Option<AppAction> {
     match key.code {
         KeyCode::Esc => Some(AppAction::CancelInput),
         KeyCode::Enter => Some(AppAction::ConfirmInput),
+        KeyCode::Tab => Some(AppAction::AcceptCommandCompletion),
         KeyCode::Backspace => Some(AppAction::DeleteInputChar),
+        KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
+            Some(AppAction::NextCommandCompletion)
+        }
+        KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+            Some(AppAction::PreviousCommandCompletion)
+        }
         KeyCode::Char(c) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
             Some(AppAction::EditInput(c))
         }
@@ -112,7 +122,7 @@ fn search_input_action(key: KeyEvent) -> Option<AppAction> {
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use super::{action_for_key, AppAction};
+    use super::{AppAction, action_for_key};
 
     #[test]
     fn project_mode_maps_navigation_and_actions() {
@@ -227,6 +237,33 @@ mod tests {
                 KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
             ),
             Some(AppAction::ConfirmInput)
+        );
+        assert_eq!(
+            action_for_key(
+                true,
+                false,
+                false,
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)
+            ),
+            Some(AppAction::AcceptCommandCompletion)
+        );
+        assert_eq!(
+            action_for_key(
+                true,
+                false,
+                false,
+                KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL)
+            ),
+            Some(AppAction::NextCommandCompletion)
+        );
+        assert_eq!(
+            action_for_key(
+                true,
+                false,
+                false,
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL)
+            ),
+            Some(AppAction::PreviousCommandCompletion)
         );
     }
 
