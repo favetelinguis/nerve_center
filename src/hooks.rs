@@ -145,8 +145,60 @@ async function sendState(payload) {
   }
 }
 
+function normalizeToolName(tool) {
+  return typeof tool === "string" ? tool.toLowerCase().replace(/[_-]/g, "") : ""
+}
+
+function isQuestionTool(tool, input) {
+  const toolName = normalizeToolName(tool)
+  return toolName === "question" || toolName === "askuserquestion" || hasQuestionsInput(input)
+}
+
+function hasQuestionsInput(input) {
+  return Array.isArray(input?.questions) && input.questions.length > 0
+}
+
+function questionToolState(part) {
+  if (!part || part.type !== "tool") {
+    return null
+  }
+
+  const toolState = part.state
+  const looksLikeQuestionTool = isQuestionTool(part.tool, toolState?.input)
+
+  if (!looksLikeQuestionTool || !toolState || typeof toolState.status !== "string") {
+    return null
+  }
+
+  if (toolState.status === "pending") {
+    return "needs_input"
+  }
+
+  if (
+    toolState.status === "running" ||
+    toolState.status === "completed" ||
+    toolState.status === "error"
+  ) {
+    return "working"
+  }
+
+  return null
+}
+
 export const NerveCenterPlugin = async (_ctx) => {
   return {
+    "tool.execute.before": async (input) => {
+      if (!isQuestionTool(input?.tool, input?.args)) {
+        return
+      }
+
+      await sendState({
+        runtime: "opencode",
+        state: "needs_input",
+        event_type: "tool.execute.before",
+        awaiting_user: "question",
+      })
+    },
     event: async ({ event }) => {
       if (!event || !event.type) {
         return
@@ -165,12 +217,38 @@ export const NerveCenterPlugin = async (_ctx) => {
         case "session.error":
           await sendState({ runtime: "opencode", state: "error", event_type: event.type })
           break
+        case "permission.updated":
         case "permission.asked":
-          await sendState({ runtime: "opencode", state: "needs_input", event_type: event.type })
+          await sendState({
+            runtime: "opencode",
+            state: "needs_input",
+            event_type: event.type,
+            awaiting_user: "permission",
+          })
+          break
+        case "question.asked":
+          await sendState({
+            runtime: "opencode",
+            state: "needs_input",
+            event_type: event.type,
+            awaiting_user: "question",
+          })
           break
         case "permission.replied":
           await sendState({ runtime: "opencode", state: "working", event_type: event.type })
           break
+        case "message.part.updated": {
+          const state = questionToolState(event.properties?.part)
+          if (state) {
+            await sendState({
+              runtime: "opencode",
+              state,
+              event_type: event.type,
+              awaiting_user: state === "needs_input" ? "question" : null,
+            })
+          }
+          break
+        }
         default:
           break
       }
@@ -282,33 +360,51 @@ fn ingest_opencode_event() -> Result<()> {
         .get("event_type")
         .and_then(Value::as_str)
         .unwrap_or("opencode");
+    let awaiting_user = payload.get("awaiting_user").and_then(Value::as_str);
 
     update_pane_state(pane_id, "opencode", |state| {
-        match state_name {
-            "working" => {
-                state.main_state = "working".to_string();
-                state.awaiting_user = None;
-                state.error = None;
-            }
-            "needs_input" => {
-                state.awaiting_user = Some("permission".to_string());
-            }
-            "done" => {
-                state.main_state = "done".to_string();
-                state.awaiting_user = None;
-                state.error = None;
-                state.subagent_count = 0;
-            }
-            "error" => {
-                state.main_state = "error".to_string();
-                state.awaiting_user = None;
-                state.error = Some(event_type.to_string());
-                state.subagent_count = 0;
-            }
-            _ => {}
-        }
-        state.touch(event_type);
+        apply_opencode_state_update(state, state_name, event_type, awaiting_user);
     })
+}
+
+fn apply_opencode_state_update(
+    state: &mut PaneAgentState,
+    state_name: &str,
+    event_type: &str,
+    awaiting_user: Option<&str>,
+) {
+    match state_name {
+        "working" => {
+            state.main_state = "working".to_string();
+            state.error = None;
+
+            if clears_opencode_input_wait(event_type) {
+                state.awaiting_user = None;
+            }
+        }
+        "needs_input" => {
+            state.awaiting_user = Some(awaiting_user.unwrap_or("permission").to_string());
+            state.error = None;
+        }
+        "done" => {
+            state.main_state = "done".to_string();
+            state.awaiting_user = None;
+            state.error = None;
+            state.subagent_count = 0;
+        }
+        "error" => {
+            state.main_state = "error".to_string();
+            state.awaiting_user = None;
+            state.error = Some(event_type.to_string());
+            state.subagent_count = 0;
+        }
+        _ => {}
+    }
+    state.touch(event_type);
+}
+
+fn clears_opencode_input_wait(event_type: &str) -> bool {
+    matches!(event_type, "permission.replied" | "message.part.updated")
 }
 
 fn update_pane_state<F>(pane_id: u64, source: &str, mutate: F) -> Result<()>
@@ -764,9 +860,51 @@ mod tests {
         let plugin = fs::read_to_string(plugin_path).expect("plugin should be readable");
         assert!(plugin.contains(OPENCODE_SUBCOMMAND_NAME));
         assert!(plugin.contains("session.idle"));
+        assert!(plugin.contains("message.part.updated"));
+        assert!(plugin.contains("tool.execute.before"));
+        assert!(plugin.contains("question.asked"));
+        assert!(plugin.contains("permission.updated"));
         assert!(plugin.contains("permission.replied"));
+        assert!(plugin.contains("questions"));
         assert!(!plugin.contains("status === \"idle\""));
-        assert!(!plugin.contains("permission.updated"));
+    }
+
+    #[test]
+    fn opencode_question_prompt_sets_needs_input_until_resolved() {
+        let mut state = PaneAgentState::new(42, "opencode");
+
+        apply_opencode_state_update(
+            &mut state,
+            "needs_input",
+            "message.part.updated",
+            Some("question"),
+        );
+
+        assert_eq!(state.awaiting_user.as_deref(), Some("question"));
+        assert_eq!(state.effective_state, "needs_input");
+
+        apply_opencode_state_update(&mut state, "working", "message.part.updated", None);
+
+        assert_eq!(state.awaiting_user, None);
+        assert_eq!(state.main_state, "working");
+        assert_eq!(state.effective_state, "working");
+    }
+
+    #[test]
+    fn opencode_session_status_does_not_clear_pending_question() {
+        let mut state = PaneAgentState::new(42, "opencode");
+
+        apply_opencode_state_update(
+            &mut state,
+            "needs_input",
+            "tool.execute.before",
+            Some("question"),
+        );
+        apply_opencode_state_update(&mut state, "working", "session.status", None);
+
+        assert_eq!(state.awaiting_user.as_deref(), Some("question"));
+        assert_eq!(state.main_state, "working");
+        assert_eq!(state.effective_state, "needs_input");
     }
 
     #[test]
