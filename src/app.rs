@@ -294,6 +294,10 @@ impl App {
         self.selected_project().map(|project| project.cwd.as_str())
     }
 
+    pub fn selected_project_name(&self) -> Option<&str> {
+        self.selected_project().map(|project| project.name.as_str())
+    }
+
     pub fn is_input_active(&self) -> bool {
         self.input_mode.is_some()
     }
@@ -392,7 +396,10 @@ impl App {
                 self.open_project_in_other_pane(wezterm, SpawnCommand::shell())
             }
             AppAction::OpenProjectEditor => {
-                self.open_project_in_other_pane(wezterm, SpawnCommand::nvim())
+                if self.selected_project().is_none() {
+                    self.record_error("No projects found");
+                }
+                Ok(())
             }
             AppAction::SelectPreviousProjectAgent => self.switch_project_agent(wezterm, -1),
             AppAction::SelectNextProjectAgent => self.switch_project_agent(wezterm, 1),
@@ -2863,7 +2870,7 @@ exit 1
     }
 
     #[test]
-    fn project_editor_open_uses_selected_project_cwd_without_refocusing_tui() {
+    fn project_editor_action_does_not_change_wezterm_layout() {
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
         let mut app =
@@ -2874,26 +2881,8 @@ exit 1
         app.apply(AppAction::OpenProjectEditor, &mut wezterm)
             .expect("open should succeed");
 
-        assert_eq!(
-            wezterm.calls,
-            vec![
-                Call::ListPanes,
-                Call::SpawnNewTab {
-                    pane_id: 10,
-                    cwd: "/tmp/repos/beta".to_string(),
-                    command: SpawnCommand::nvim(),
-                },
-                Call::ListPanes,
-                Call::SplitPane {
-                    host_pane_id: 10,
-                    move_pane_id: 21,
-                    direction: SplitDirection::Right,
-                },
-                Call::ActivatePane(21),
-                Call::ListPanes,
-            ]
-        );
-        assert_eq!(app.attached_pane_id, Some(21));
+        assert_eq!(wezterm.calls, vec![Call::ListPanes]);
+        assert_eq!(app.attached_pane_id, None);
     }
 
     #[test]

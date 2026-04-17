@@ -59,10 +59,6 @@ impl SpawnCommand {
         Self::new("shell", vec!["zsh".to_string(), "-il".to_string()])
     }
 
-    pub fn nvim() -> Self {
-        Self::new("nvim", vec!["nvim".to_string()])
-    }
-
     pub fn label(&self) -> &str {
         &self.label
     }

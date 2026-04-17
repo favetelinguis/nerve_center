@@ -80,7 +80,7 @@ nerve_center doctor
 - `i`: attach the selected project's preferred running agent into the side pane and start forwarding mode
 - `o`: open the selected project with `idea <project-path>`
 - `t`: open a shell for the selected project in the side pane without refocusing the TUI
-- `e`: open `nvim` for the selected project in the side pane without refocusing the TUI
+- `e`: open `nvim` for the selected project in the current TUI pane and return when `nvim` exits
 - `q`: quit
 
 ### Command Input Mode
