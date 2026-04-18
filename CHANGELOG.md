@@ -24,3 +24,36 @@
 - `866af6d` add agent command completion
 - `83a6ec7` add a follow mode for active agent
 - `91e47c2` add support for pi agent
+
+## 0.1.0 - 2026-04-16
+
+### Added
+- Initial WezTerm-focused TUI for browsing local git projects.
+- Project view with branch and git status summaries.
+- Linked worktree management commands including add, remove, merge, PR, and land workflows.
+- Agent monitoring for Claude and OpenCode panes.
+- Support for multiple agents per project and tab switching between agents and projects.
+- Config file support for defining repository sources.
+- GitHub Actions release workflow.
+
+### Changed
+- Decoupled repository naming from branch naming in the UI.
+- Updated project switching to change the pane cwd for better WezTerm project workflows.
+- Improved command discovery and expanded the README.
+
+### Commits included in 0.1.0
+- `c0e14d0` intial switcher for wezterm
+- `be06d0c` add prject view
+- `0819bec` add level 1 worktree support
+- `1d4dc8c` add remove command
+- `16f42cb` add merge pr land
+- `5518433` decouple branch name and repo name
+- `510d2ec` add git status to project view
+- `bb3416d` add agent monitoring opencode and claude
+- `4ce8eaf` add gh workflow for release
+- `60ddcc8` add config file
+- `dec4dd7` add better command discovery
+- `4e05de6` have proper tab switching for agents and projects
+- `22b27d8` change cwd on project switch will make wezproject work wonders
+- `3465b3c` add support for multiple agents in a project
+- `cf07bf5` update readme
