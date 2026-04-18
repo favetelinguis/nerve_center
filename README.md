@@ -267,11 +267,11 @@ Notes:
 
 ## Releases
 
-Release artifacts are built with `cargo-dist` by GitHub Actions when you push a version tag such as `v0.1.0`.
+Release artifacts are built with `cargo-dist` by GitHub Actions when you push a version tag such as `v0.2.0`.
 
 Typical release flow:
 
 ```sh
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
