@@ -2708,7 +2708,7 @@ mod tests {
             window_title: "window".to_string(),
             is_active: false,
             is_zoomed: false,
-            tty_name: format!("/dev/pts/{pane_id}"),
+            tty_name: Some(format!("/dev/pts/{pane_id}")),
         }
     }
 

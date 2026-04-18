@@ -15,6 +15,7 @@ pub enum CommandProjectKind {
 pub enum AgentRuntime {
     Claude,
     OpenCode,
+    Pi,
 }
 
 impl AgentRuntime {
@@ -22,6 +23,7 @@ impl AgentRuntime {
         match name {
             "claude" | "claude-code" => Ok(Self::Claude),
             "opencode" => Ok(Self::OpenCode),
+            "pi" => Ok(Self::Pi),
             _ => bail!("unknown agent runtime: {name}"),
         }
     }
@@ -30,6 +32,7 @@ impl AgentRuntime {
         match name.trim().to_ascii_lowercase().as_str() {
             "claude" | "claude-code" | "cc" => Some(Self::Claude),
             "opencode" | "oc" => Some(Self::OpenCode),
+            "pi" => Some(Self::Pi),
             _ => None,
         }
     }
@@ -38,6 +41,7 @@ impl AgentRuntime {
         match self {
             Self::Claude => "claude",
             Self::OpenCode => "opencode",
+            Self::Pi => "pi",
         }
     }
 
@@ -45,6 +49,7 @@ impl AgentRuntime {
         match self {
             Self::Claude => "cc",
             Self::OpenCode => "oc",
+            Self::Pi => "pi",
         }
     }
 
@@ -138,7 +143,7 @@ const NO_ARGS: &[ArgumentSpec] = &[];
 const AGENT_RUNTIME_ARGS: &[ArgumentSpec] = &[ArgumentSpec {
     name: "runtime",
     required: true,
-    source: CompletionSource::Static(&["claude", "opencode"]),
+    source: CompletionSource::Static(&["claude", "opencode", "pi"]),
 }];
 const WT_ADD_ARGS: &[ArgumentSpec] = &[ArgumentSpec {
     name: "branch-name",
@@ -619,6 +624,19 @@ mod tests {
     }
 
     #[test]
+    fn agent_completion_includes_pi_runtime() {
+        let items = complete_labels(
+            CommandContext {
+                project_kind: Some(CommandProjectKind::Root),
+                root_cwd: Some("/tmp/root"),
+            },
+            "agent ",
+        )
+        .expect("agent runtime completions should resolve");
+        assert_eq!(items, vec!["claude", "opencode", "pi"]);
+    }
+
+    #[test]
     fn wt_add_shows_branch_placeholder() {
         let items = complete_items(
             CommandContext {
@@ -748,6 +766,12 @@ mod tests {
             parse_project_command("agent claude").expect("agent should parse"),
             ProjectCommand::Agent {
                 runtime: AgentRuntime::Claude,
+            }
+        );
+        assert_eq!(
+            parse_project_command("agent pi").expect("pi agent should parse"),
+            ProjectCommand::Agent {
+                runtime: AgentRuntime::Pi,
             }
         );
     }

@@ -1,6 +1,6 @@
 # Nerve Center
 
-`nerve_center` is a WezTerm-focused terminal UI for browsing local git projects, managing linked worktrees, and jumping between Claude and OpenCode agent panes for the selected project.
+`nerve_center` is a WezTerm-focused terminal UI for browsing local git projects, managing linked worktrees, and jumping between Claude, OpenCode, and pi agent panes for the selected project.
 
 ## Install
 
@@ -30,7 +30,7 @@ Optional tools used by specific features:
 - `gh` for `wt pr`
 - `idea` for the `o` keybinding
 - `nvim` for the `e` keybinding
-- `claude` and/or `opencode` for `agent <runtime>` commands
+- `claude`, `opencode`, and/or `pi` for `agent <runtime>` commands
 
 ## Quick Start
 
@@ -137,6 +137,7 @@ Completions are hierarchical and context-aware:
 
 - `agent claude`: open a new Claude tab rooted at the selected project
 - `agent opencode`: open a new OpenCode tab rooted at the selected project
+- `agent pi`: open a new pi tab rooted at the selected project
 
 ### Git Commands
 
@@ -185,7 +186,20 @@ Remove the OpenCode plugin hook bridge installed by `nerve_center`:
 nerve_center --remove-hooks-opencode
 ```
 
+Install the pi hook bridge extension:
+
+```sh
+nerve_center --install-hooks-pi
+```
+
+Remove the pi hook bridge extension installed by `nerve_center`:
+
+```sh
+nerve_center --remove-hooks-pi
+```
+
 The install commands first remove any older `nerve_center` hook entries they can find, then install the current hook set for a clean update path.
+For pi, the bridge is installed as `~/.pi/agent/extensions/nerve_center.ts`; restart pi or run `/reload` in existing sessions after installing or removing it.
 
 These commands write agent state files to `~/.local/data/nerve_center/<wezterm-pane-id>` when the agent is working, done, errored, or waiting for user input.
 
@@ -193,6 +207,7 @@ There are also hidden internal subcommands used by those hook installers:
 
 - `nerve_center internal ingest-claude-hook`
 - `nerve_center internal ingest-opencode-event`
+- `nerve_center internal ingest-pi-event`
 
 These are not meant to be run manually.
 
@@ -227,6 +242,7 @@ Agent monitor symbols:
 
 - `cc`: Claude
 - `oc`: OpenCode
+- `pi`: pi
 - `[w]`: working
 - `[i]`: needs input
 - `[d]`: done
@@ -242,7 +258,7 @@ Notes:
 
 1. Open WezTerm in a pane and run `nerve_center`.
 2. Select a repository or linked worktree with `j` and `k`.
-3. Start an agent with `:agent claude` or `:agent opencode`.
+3. Start an agent with `:agent claude`, `:agent opencode`, or `:agent pi`.
 4. Install hooks if you want live agent state in the project list.
 5. Press `i` to attach the agent when it is time to interact with it.
 6. Press `Ctrl-f` if you want `nerve_center` to keep surfacing the next agent that needs input across all running agents.

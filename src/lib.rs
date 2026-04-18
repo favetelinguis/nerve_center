@@ -21,16 +21,24 @@ pub fn run() -> Result<()> {
     if cli.remove_hooks_opencode {
         hooks::remove_opencode_hooks()?;
     }
+    if cli.remove_hooks_pi {
+        hooks::remove_pi_hooks()?;
+    }
     if cli.install_hooks_claude {
         hooks::install_claude_hooks()?;
     }
     if cli.install_hooks_opencode {
         hooks::install_opencode_hooks()?;
     }
+    if cli.install_hooks_pi {
+        hooks::install_pi_hooks()?;
+    }
     if cli.remove_hooks_claude
         || cli.remove_hooks_opencode
+        || cli.remove_hooks_pi
         || cli.install_hooks_claude
         || cli.install_hooks_opencode
+        || cli.install_hooks_pi
     {
         return Ok(());
     }

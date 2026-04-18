@@ -1,5 +1,6 @@
 use std::env;
 use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -24,7 +25,7 @@ pub struct PaneInfo {
     pub window_title: String,
     pub is_active: bool,
     pub is_zoomed: bool,
-    pub tty_name: String,
+    pub tty_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -95,9 +96,7 @@ pub struct ProcessWezterm;
 impl WeztermClient for ProcessWezterm {
     fn list_panes(&mut self) -> Result<Vec<PaneInfo>> {
         let output = run_wezterm_cli(["list", "--format", "json"])?;
-        let panes: Vec<PaneInfo> =
-            serde_json::from_str(&output).context("failed to parse wezterm pane list JSON")?;
-        Ok(panes)
+        parse_pane_list_output(&output)
     }
 
     fn move_pane_to_new_tab(&mut self, pane_id: u64) -> Result<()> {
@@ -151,12 +150,100 @@ impl WeztermClient for ProcessWezterm {
             cwd.to_string(),
             "--".to_string(),
         ];
-        args.extend(command.argv().iter().cloned());
+        args.extend(resolve_spawn_argv(command));
         let output = run_wezterm_cli(args)?;
         output.trim().parse::<u64>().with_context(|| {
             format!("failed to parse spawned pane id from wezterm cli output: {output:?}")
         })
     }
+}
+
+fn resolve_spawn_argv(command: &SpawnCommand) -> Vec<String> {
+    let mut argv = command.argv().to_vec();
+    if let Some(program) = argv.first_mut() {
+        if let Some(resolved) = resolve_executable(program) {
+            *program = resolved;
+        }
+    }
+    argv
+}
+
+fn resolve_executable(program: &str) -> Option<String> {
+    if program.contains('/') {
+        return Some(program.to_string());
+    }
+
+    executable_search_dirs()
+        .into_iter()
+        .map(|dir| dir.join(program))
+        .find(|path| is_candidate_executable(path))
+        .and_then(|path| path.to_str().map(str::to_string))
+}
+
+fn executable_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = env::var_os("PATH")
+        .map(|value| env::split_paths(&value).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    for extra in npm_search_dirs() {
+        if !dirs.iter().any(|existing| existing == &extra) {
+            dirs.push(extra);
+        }
+    }
+
+    dirs
+}
+
+fn npm_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    if let Ok(home) = env::var("HOME") {
+        dirs.push(PathBuf::from(&home).join(".local/npm/bin"));
+        dirs.push(PathBuf::from(&home).join(".npm-global/bin"));
+    }
+
+    if let Some(prefix) = npm_global_prefix() {
+        dirs.push(prefix.join("bin"));
+    }
+
+    dirs
+}
+
+fn npm_global_prefix() -> Option<PathBuf> {
+    let output = Command::new("npm")
+        .args(["prefix", "-g"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let prefix = String::from_utf8(output.stdout).ok()?;
+    let prefix = prefix.trim();
+    (!prefix.is_empty()).then(|| PathBuf::from(prefix))
+}
+
+fn is_candidate_executable(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn parse_pane_list_output(output: &str) -> Result<Vec<PaneInfo>> {
+    if let Ok(panes) = serde_json::from_str::<Vec<PaneInfo>>(output) {
+        return Ok(panes);
+    }
+
+    let start = output.find('[');
+    let end = output.rfind(']');
+    if let (Some(start), Some(end)) = (start, end) {
+        if start <= end {
+            let candidate = &output[start..=end];
+            if let Ok(panes) = serde_json::from_str::<Vec<PaneInfo>>(candidate) {
+                return Ok(panes);
+            }
+        }
+    }
+
+    Err(anyhow!("failed to parse wezterm pane list JSON"))
 }
 
 pub fn tui_pane_id_from_env() -> Result<u64> {
@@ -230,7 +317,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{PaneInfo, TuiTabLayout, find_pane, listable_panes, tui_tab_layout};
+    use super::{
+        PaneInfo, TuiTabLayout, find_pane, listable_panes, parse_pane_list_output, tui_tab_layout,
+    };
 
     const SAMPLE_JSON: &str = r#"
 [
@@ -325,6 +414,14 @@ mod tests {
         assert_eq!(panes.len(), 3);
         assert_eq!(panes[0].pane_id, 341);
         assert_eq!(panes[1].title, "shell");
+    }
+
+    #[test]
+    fn parses_wezterm_json_with_prefix_noise() {
+        let noisy = format!("warning: something\n{}\n", SAMPLE_JSON);
+        let panes = parse_pane_list_output(&noisy).expect("pane list should parse with noise");
+        assert_eq!(panes.len(), 3);
+        assert_eq!(panes[2].pane_id, 346);
     }
 
     #[test]

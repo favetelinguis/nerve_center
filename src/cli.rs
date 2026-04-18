@@ -16,11 +16,17 @@ pub struct Cli {
     #[arg(long = "install-hooks-opencode")]
     pub install_hooks_opencode: bool,
 
+    #[arg(long = "install-hooks-pi")]
+    pub install_hooks_pi: bool,
+
     #[arg(long = "remove-hooks-claude")]
     pub remove_hooks_claude: bool,
 
     #[arg(long = "remove-hooks-opencode")]
     pub remove_hooks_opencode: bool,
+
+    #[arg(long = "remove-hooks-pi")]
+    pub remove_hooks_pi: bool,
 
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -46,6 +52,7 @@ pub struct InternalCli {
 pub enum InternalCommands {
     IngestClaudeHook,
     IngestOpencodeEvent,
+    IngestPiEvent,
 }
 
 pub fn run_list<W: WeztermClient>(wezterm: &mut W) -> Result<()> {

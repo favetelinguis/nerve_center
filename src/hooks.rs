@@ -16,6 +16,7 @@ use crate::cli::InternalCommands;
 
 const CLAUDE_COMMAND_NAME: &str = "internal ingest-claude-hook";
 const OPENCODE_SUBCOMMAND_NAME: &str = "ingest-opencode-event";
+const PI_SUBCOMMAND_NAME: &str = "ingest-pi-event";
 const LOCK_STALE_AFTER_MS: u64 = 30_000;
 const LOCK_RETRY_DELAY_MS: u64 = 10;
 const LOCK_RETRY_LIMIT: usize = 500;
@@ -286,10 +287,130 @@ fn remove_opencode_hooks_at(plugin_path: &Path) -> Result<()> {
     }
 }
 
+pub fn install_pi_hooks() -> Result<()> {
+    let extension_path = pi_extension_path()?;
+    let binary = current_executable_string()?;
+    install_pi_hooks_at(&extension_path, &binary)
+}
+
+fn install_pi_hooks_at(extension_path: &Path, binary: &str) -> Result<()> {
+    ensure_parent_dir(extension_path)?;
+
+    let extension = r#"import { spawn } from "node:child_process";
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+
+const BINARY = __BINARY__;
+const COMMAND = "__PI_COMMAND__";
+
+async function sendState(payload) {
+  if (!process.env.WEZTERM_PANE) {
+    return;
+  }
+
+  try {
+    await new Promise((resolve) => {
+      const proc = spawn(BINARY, ["internal", COMMAND], {
+        stdio: ["pipe", "ignore", "ignore"],
+        env: process.env,
+      });
+      proc.on("error", () => resolve(undefined));
+      proc.on("close", () => resolve(undefined));
+      proc.stdin.end(JSON.stringify(payload));
+    });
+  } catch (_error) {
+  }
+}
+
+export default function (pi: ExtensionAPI) {
+  let sawError = false;
+
+  pi.on("session_start", async () => {
+    sawError = false;
+    await sendState({ runtime: "pi", state: "done", event_type: "session_start" });
+  });
+
+  pi.on("agent_start", async () => {
+    sawError = false;
+    await sendState({ runtime: "pi", state: "working", event_type: "agent_start" });
+  });
+
+  pi.on("tool_execution_start", async () => {
+    await sendState({ runtime: "pi", state: "working", event_type: "tool_execution_start" });
+  });
+
+  pi.on("message_end", async (event) => {
+    const message = event.message;
+    if (!message || message.role !== "assistant") {
+      return;
+    }
+
+    const error = typeof message.errorMessage === "string" ? message.errorMessage : undefined;
+    if (message.stopReason === "error" || message.stopReason === "aborted" || error) {
+      sawError = true;
+      await sendState({
+        runtime: "pi",
+        state: "error",
+        event_type: "message_end",
+        error: error ?? String(message.stopReason ?? "error"),
+      });
+    }
+  });
+
+  pi.on("agent_end", async () => {
+    await sendState({
+      runtime: "pi",
+      state: sawError ? "error" : "done",
+      event_type: "agent_end",
+    });
+  });
+
+  pi.on("session_shutdown", async () => {
+    sawError = false;
+    await sendState({ runtime: "pi", state: "done", event_type: "session_shutdown" });
+  });
+}
+"#
+    .replace("__BINARY__", &serde_json::to_string(binary)?)
+    .replace("__PI_COMMAND__", PI_SUBCOMMAND_NAME);
+
+    fs::write(extension_path, extension)
+        .with_context(|| format!("failed to write {}", extension_path.display()))?;
+    println!(
+        "Installed pi extension into {} (restart pi or run /reload in existing sessions)",
+        extension_path.display()
+    );
+    Ok(())
+}
+
+pub fn remove_pi_hooks() -> Result<()> {
+    let extension_path = pi_extension_path()?;
+    remove_pi_hooks_at(&extension_path)
+}
+
+fn remove_pi_hooks_at(extension_path: &Path) -> Result<()> {
+    match fs::remove_file(extension_path) {
+        Ok(()) => {
+            println!(
+                "Removed pi extension from {} (restart pi or run /reload in existing sessions)",
+                extension_path.display()
+            );
+            Ok(())
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            println!("No pi extension found at {}", extension_path.display());
+            Ok(())
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to remove {}", extension_path.display()))
+        }
+    }
+}
+
 pub fn run_internal(command: InternalCommands) -> Result<()> {
     match command {
         InternalCommands::IngestClaudeHook => ingest_claude_hook(),
         InternalCommands::IngestOpencodeEvent => ingest_opencode_event(),
+        InternalCommands::IngestPiEvent => ingest_pi_event(),
     }
 }
 
@@ -367,6 +488,25 @@ fn ingest_opencode_event() -> Result<()> {
     })
 }
 
+fn ingest_pi_event() -> Result<()> {
+    let pane_id = pane_id_from_env()?;
+    let payload = read_stdin_json()?;
+    let state_name = payload
+        .get("state")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("pi payload missing state"))?;
+    let event_type = payload
+        .get("event_type")
+        .and_then(Value::as_str)
+        .unwrap_or("pi");
+    let awaiting_user = payload.get("awaiting_user").and_then(Value::as_str);
+    let error = payload.get("error").and_then(Value::as_str);
+
+    update_pane_state(pane_id, "pi", |state| {
+        apply_pi_state_update(state, state_name, event_type, awaiting_user, error);
+    })
+}
+
 fn apply_opencode_state_update(
     state: &mut PaneAgentState,
     state_name: &str,
@@ -405,6 +545,41 @@ fn apply_opencode_state_update(
 
 fn clears_opencode_input_wait(event_type: &str) -> bool {
     matches!(event_type, "permission.replied" | "message.part.updated")
+}
+
+fn apply_pi_state_update(
+    state: &mut PaneAgentState,
+    state_name: &str,
+    event_type: &str,
+    awaiting_user: Option<&str>,
+    error: Option<&str>,
+) {
+    match state_name {
+        "working" => {
+            state.main_state = "working".to_string();
+            state.awaiting_user = None;
+            state.error = None;
+        }
+        "needs_input" => {
+            state.main_state = "working".to_string();
+            state.awaiting_user = Some(awaiting_user.unwrap_or("input").to_string());
+            state.error = None;
+        }
+        "done" => {
+            state.main_state = "done".to_string();
+            state.awaiting_user = None;
+            state.error = None;
+            state.subagent_count = 0;
+        }
+        "error" => {
+            state.main_state = "error".to_string();
+            state.awaiting_user = None;
+            state.error = Some(error.unwrap_or(event_type).to_string());
+            state.subagent_count = 0;
+        }
+        _ => {}
+    }
+    state.touch(event_type);
 }
 
 fn update_pane_state<F>(pane_id: u64, source: &str, mutate: F) -> Result<()>
@@ -475,6 +650,11 @@ fn claude_settings_path() -> Result<PathBuf> {
 fn opencode_plugin_path() -> Result<PathBuf> {
     let home = env::var("HOME").context("HOME is not set")?;
     Ok(PathBuf::from(home).join(".config/opencode/plugins/nerve_center.js"))
+}
+
+fn pi_extension_path() -> Result<PathBuf> {
+    let home = env::var("HOME").context("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".pi/agent/extensions/nerve_center.ts"))
 }
 
 fn current_executable_string() -> Result<String> {
@@ -933,6 +1113,49 @@ mod tests {
 
         let state = fs::read_to_string(state_path).expect("pane file should exist");
         assert!(state.contains("\"source\": \"opencode\""));
+        assert!(state.contains("\"effective_state\": \"working\""));
+    }
+
+    #[test]
+    fn pi_installer_writes_extension() {
+        let home = test_dir("pi-install");
+        let extension_path = home.join(".pi/agent/extensions/nerve_center.ts");
+
+        install_pi_hooks_at(&extension_path, "/tmp/nerve_center")
+            .expect("pi install should succeed");
+
+        let extension = fs::read_to_string(extension_path).expect("extension should be readable");
+        assert!(extension.contains(PI_SUBCOMMAND_NAME));
+        assert!(extension.contains("agent_start"));
+        assert!(extension.contains("session_shutdown"));
+        assert!(extension.contains("runtime: \"pi\""));
+    }
+
+    #[test]
+    fn pi_remover_deletes_extension_file() {
+        let home = test_dir("pi-remove");
+        let extension_path = home.join(".pi/agent/extensions/nerve_center.ts");
+
+        ensure_parent_dir(&extension_path).expect("extension parent should be created");
+        fs::write(&extension_path, "stale extension").expect("extension should be seeded");
+
+        remove_pi_hooks_at(&extension_path).expect("pi remove should succeed");
+
+        assert!(!extension_path.exists());
+    }
+
+    #[test]
+    fn pi_state_update_writes_pane_file() {
+        let data_dir = test_dir("pi-state");
+        let state_path = data_dir.join("42");
+
+        update_pane_state_at_path(&state_path, 42, "pi", |state| {
+            apply_pi_state_update(state, "working", "agent_start", None, None);
+        })
+        .expect("pi state write should succeed");
+
+        let state = fs::read_to_string(state_path).expect("pane file should exist");
+        assert!(state.contains("\"source\": \"pi\""));
         assert!(state.contains("\"effective_state\": \"working\""));
     }
 
