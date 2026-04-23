@@ -66,10 +66,18 @@ Useful companion commands:
 ```sh
 nerve_center list
 nerve_center doctor
+nerve_center daemon
+nerve_center daemon start
+nerve_center daemon stop
+nerve_center daemon restart
 ```
 
 - `nerve_center list`: print the current selectable WezTerm pane list without starting the TUI
 - `nerve_center doctor`: validate that WezTerm integration is working and print basic pane information
+- `nerve_center daemon`: run the long-lived local daemon that owns snapshots and mutating project operations
+- `nerve_center daemon start`: start the daemon if it is not already running
+- `nerve_center daemon stop`: ask the running daemon to exit cleanly; errors if no daemon is running
+- `nerve_center daemon restart`: stop the running daemon and start a fresh one; errors if no daemon is running
 
 ## Keybindings
 

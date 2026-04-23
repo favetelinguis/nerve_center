@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
-use crate::wezterm::{PaneInfo, WeztermClient, listable_panes, sort_panes, tui_pane_id_from_env};
+use crate::wezterm::{listable_panes, sort_panes, tui_pane_id_from_env, PaneInfo, WeztermClient};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -38,8 +38,20 @@ pub enum Commands {
     List,
     /// Validate that WezTerm integration prerequisites are available
     Doctor,
+    Daemon {
+        #[command(subcommand)]
+        command: Option<DaemonCommand>,
+    },
     #[command(hide = true)]
     Internal(InternalCli),
+}
+
+#[derive(Debug, Subcommand, Clone, Copy)]
+pub enum DaemonCommand {
+    Run,
+    Start,
+    Stop,
+    Restart,
 }
 
 #[derive(Debug, Args)]
@@ -91,4 +103,32 @@ fn format_pane_line(pane: &PaneInfo) -> String {
         "[pane {}] window={} tab={} active={} title={} cwd={}",
         pane.pane_id, pane.window_id, pane.tab_id, pane.is_active, pane.title, pane.cwd
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands, DaemonCommand};
+    use clap::Parser;
+
+    #[test]
+    fn parses_daemon_restart_subcommand() {
+        let cli = Cli::parse_from(["nerve_center", "daemon", "restart"]);
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Daemon {
+                command: Some(DaemonCommand::Restart)
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_bare_daemon_command_as_no_subcommand() {
+        let cli = Cli::parse_from(["nerve_center", "daemon"]);
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Daemon { command: None })
+        ));
+    }
 }

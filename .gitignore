@@ -1,3 +1,14 @@
 /target
-/docs
+/.superpowers
+/agent-spool.jsonl
+/operation-journal.jsonl
+/daemon.sock
+/docs/*
+!/docs/superpowers/
+/docs/superpowers/*
+!/docs/superpowers/plans/
+!/docs/superpowers/plans/*.md
+!/docs/superpowers/specs/
+!/docs/superpowers/specs/*.md
 **/.codex
+/docs/superpowers

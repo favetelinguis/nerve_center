@@ -130,7 +130,7 @@ fn search_input_action(key: KeyEvent) -> Option<AppAction> {
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-    use super::{AppAction, action_for_key};
+    use super::{action_for_key, AppAction};
 
     #[test]
     fn project_mode_maps_navigation_and_actions() {

@@ -3,7 +3,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -210,10 +210,7 @@ fn npm_search_dirs() -> Vec<PathBuf> {
 }
 
 fn npm_global_prefix() -> Option<PathBuf> {
-    let output = Command::new("npm")
-        .args(["prefix", "-g"])
-        .output()
-        .ok()?;
+    let output = Command::new("npm").args(["prefix", "-g"]).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -318,7 +315,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        PaneInfo, TuiTabLayout, find_pane, listable_panes, parse_pane_list_output, tui_tab_layout,
+        find_pane, listable_panes, parse_pane_list_output, tui_tab_layout, PaneInfo, TuiTabLayout,
     };
 
     const SAMPLE_JSON: &str = r#"
