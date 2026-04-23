@@ -17,7 +17,8 @@ Supported release artifacts:
 
 - Linux: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`
 - macOS: `x86_64-apple-darwin`, `aarch64-apple-darwin`
-- Windows: `x86_64-pc-windows-msvc`
+
+Windows artifacts are not currently published because the daemon transport uses Unix domain sockets.
 
 ## Requirements
 

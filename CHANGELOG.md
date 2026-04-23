@@ -8,6 +8,7 @@
 
 ### Changed
 - Moved workspace coordination out of the UI path so background refreshes and operations can be handled by the daemon.
+- Release artifacts are now published for macOS and Linux only because daemon transport currently depends on Unix domain sockets.
 
 ### Fixed
 - Client autostart tests now inject the existing-socket wait path instead of consulting ambient local daemon state.
