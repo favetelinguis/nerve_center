@@ -118,12 +118,19 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             .map(|project| project.branch.len())
             .max()
             .unwrap_or(0);
-        let status_width = app
+        let statuses = app
             .projects()
             .iter()
-            .map(|project| project.status_summary.display_text().len())
-            .max()
-            .unwrap_or(0);
+            .enumerate()
+            .map(|(index, project)| {
+                project_status_text(
+                    &project.status_summary.display_text(),
+                    app.project_operation_text(index).as_deref(),
+                    app.project_stale_reason(index),
+                )
+            })
+            .collect::<Vec<_>>();
+        let status_width = statuses.iter().map(String::len).max().unwrap_or(0);
         let agents = app
             .projects()
             .iter()
@@ -144,13 +151,15 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
         app.projects()
             .iter()
-            .zip(labels)
-            .zip(agents)
-            .map(|((project, label), agents)| {
+            .enumerate()
+            .map(|(index, project)| {
+                let label = &labels[index];
+                let status = &statuses[index];
+                let agents = &agents[index];
                 let text = format!(
                     "{label:<label_width$}  {branch:<branch_width$}  {status:<status_width$}  {agents}",
                     branch = project.branch,
-                    status = project.status_summary.display_text(),
+                    status = status,
                     agents = agents,
                     label_width = label_width,
                     branch_width = branch_width,
@@ -171,4 +180,40 @@ fn render_projects(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         list_state.select(Some(app.selected_project_index()));
     }
     frame.render_stateful_widget(list, area, &mut list_state);
+}
+
+fn project_status_text(
+    status: &str,
+    operation: Option<&str>,
+    stale_reason: Option<&str>,
+) -> String {
+    let mut parts = vec![status.to_string()];
+    if let Some(operation) = operation {
+        parts.push(operation.to_string());
+    }
+    if let Some(reason) = stale_reason {
+        parts.push(format!("stale:{reason}"));
+    }
+    parts.join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::project_status_text;
+
+    #[test]
+    fn project_status_text_appends_stale_reason_when_present() {
+        assert_eq!(
+            project_status_text("clean", None, Some("refresh_failed")),
+            "clean stale:refresh_failed"
+        );
+    }
+
+    #[test]
+    fn project_status_text_includes_operation_state_when_present() {
+        assert_eq!(
+            project_status_text("clean", Some("op:git_pull[running]"), None),
+            "clean op:git_pull[running]"
+        );
+    }
 }

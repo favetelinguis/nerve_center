@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::process::Command;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 
 use crate::wezterm::SpawnCommand;
 
@@ -68,6 +68,21 @@ pub enum ProjectCommand {
     Agent { runtime: AgentRuntime },
     GitSwitch { branch: String },
     GitPull,
+}
+
+impl ProjectCommand {
+    pub fn operation_name(&self) -> Option<&'static str> {
+        match self {
+            Self::Add { .. } => Some("wt_add"),
+            Self::Remove => Some("wt_remove"),
+            Self::Merge { .. } => Some("wt_merge"),
+            Self::Pr { .. } => Some("wt_pr"),
+            Self::Land { .. } => Some("wt_land"),
+            Self::GitSwitch { .. } => Some("git_switch"),
+            Self::GitPull => Some("git_pull"),
+            Self::Agent { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -563,8 +578,8 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        AgentRuntime, CommandCompletion, CommandContext, CommandProjectKind, ProjectCommand,
-        apply_completion, complete_command, parse_project_command,
+        apply_completion, complete_command, parse_project_command, AgentRuntime, CommandCompletion,
+        CommandContext, CommandProjectKind, ProjectCommand,
     };
 
     #[test]

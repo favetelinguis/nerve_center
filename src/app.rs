@@ -1,23 +1,26 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::mem;
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
-use serde_json::Value;
+use anyhow::{anyhow, Context, Result};
 
 use crate::command::{
-    AgentRuntime, CommandCompletion, CommandContext, CommandProjectKind, CompletionState,
-    ProjectCommand, apply_completion, complete_command, parse_project_command,
+    apply_completion, complete_command, parse_project_command, AgentRuntime, CommandCompletion,
+    CommandContext, CommandProjectKind, CompletionState, ProjectCommand,
 };
+use crate::daemon::protocol::ClientMessage;
 use crate::input::AppAction;
-use crate::wezterm::{
-    PaneInfo, SpawnCommand, SplitDirection, TuiTabLayout, WeztermClient, find_pane, listable_panes,
-    tui_pane_id_from_env, tui_tab_layout,
+use crate::projects::{
+    build_project_entries, config_path_from_home, discover_projects_in,
+    load_repo_sources_from_config_at, normalize_pane_cwd, parse_project_status_output,
+    read_branch_name, AgentMonitorState, GitProjectProbe, ProjectAgentMonitor, ProjectEntry,
+    ProjectKind, ProjectStatusSummary,
 };
+use crate::wezterm::{
+    find_pane, listable_panes, tui_pane_id_from_env, tui_tab_layout, PaneInfo, SpawnCommand,
+    SplitDirection, TuiTabLayout, WeztermClient,
+};
+use crate::workspace::WorkspaceSnapshot;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
@@ -26,144 +29,9 @@ pub enum Mode {
     Forwarding,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProjectKind {
-    Root,
-    Worktree,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectEntry {
-    pub name: String,
-    pub cwd: String,
-    pub branch: String,
-    pub status_summary: ProjectStatusSummary,
-    pub root_name: String,
-    pub root_cwd: String,
-    pub kind: ProjectKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ProjectStatusSummary {
-    pub staged: usize,
-    pub modified: usize,
-    pub deleted: usize,
-    pub untracked: usize,
-    pub conflicts: usize,
-    pub ahead: usize,
-    pub behind: usize,
-}
-
-impl ProjectStatusSummary {
-    fn has_local_changes(&self) -> bool {
-        self.staged > 0
-            || self.modified > 0
-            || self.deleted > 0
-            || self.untracked > 0
-            || self.conflicts > 0
-    }
-
-    pub fn display_text(&self) -> String {
-        let mut parts = Vec::new();
-
-        if !self.has_local_changes() {
-            parts.push("clean".to_string());
-        } else {
-            if self.staged > 0 {
-                parts.push(format!("S{}", self.staged));
-            }
-            if self.modified > 0 {
-                parts.push(format!("M{}", self.modified));
-            }
-            if self.deleted > 0 {
-                parts.push(format!("D{}", self.deleted));
-            }
-            if self.untracked > 0 {
-                parts.push(format!("?{}", self.untracked));
-            }
-            if self.conflicts > 0 {
-                parts.push(format!("U{}", self.conflicts));
-            }
-        }
-
-        if self.ahead > 0 {
-            parts.push(format!("^{}", self.ahead));
-        }
-        if self.behind > 0 {
-            parts.push(format!("v{}", self.behind));
-        }
-
-        parts.join(" ")
-    }
-}
-
-impl ProjectEntry {
-    pub fn list_label(&self) -> String {
-        match self.kind {
-            ProjectKind::Root => self.name.clone(),
-            ProjectKind::Worktree => format!("  |- {}", self.name),
-        }
-    }
-
-    fn search_label(&self) -> &str {
-        self.name.as_str()
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct PaneRow {
     pub pane: PaneInfo,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentMonitorState {
-    Starting,
-    Working,
-    NeedsInput,
-    Done,
-    Error,
-}
-
-impl AgentMonitorState {
-    fn from_state_name(name: &str) -> Option<Self> {
-        match name.trim().to_ascii_lowercase().as_str() {
-            "working" | "busy" | "running" | "retry" => Some(Self::Working),
-            "needs_input" | "needs-input" | "input" | "awaiting_user" | "awaiting-user" => {
-                Some(Self::NeedsInput)
-            }
-            "done" | "idle" | "complete" | "completed" => Some(Self::Done),
-            "error" | "failed" => Some(Self::Error),
-            _ => None,
-        }
-    }
-
-    fn short_code(self) -> char {
-        match self {
-            Self::Starting => 's',
-            Self::Working => 'w',
-            Self::NeedsInput => 'i',
-            Self::Done => 'd',
-            Self::Error => 'e',
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectAgentMonitor {
-    pane_id: u64,
-    runtime: AgentRuntime,
-    state: AgentMonitorState,
-}
-
-impl ProjectAgentMonitor {
-    pub fn display_text(&self) -> String {
-        format!(
-            "{}:{}[{}]",
-            self.runtime.short_label(),
-            self.pane_id,
-            self.state.short_code()
-        )
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -182,21 +50,15 @@ enum InputMode {
     },
 }
 
-const DEFAULT_REPO_SOURCE: &str = "~/repos";
-
-#[derive(Debug, Deserialize)]
-struct AppConfig {
-    repo_sources: Vec<String>,
-}
-
 #[derive(Debug)]
 pub struct App {
     rows: Vec<PaneRow>,
+    workspace: WorkspaceSnapshot,
     projects: Vec<ProjectEntry>,
     project_agent_monitors: Vec<Vec<ProjectAgentMonitor>>,
     launched_agents: BTreeMap<u64, AgentRuntime>,
-    selected_project_index: usize,
-    repo_sources: Vec<PathBuf>,
+    selected_project_id: Option<String>,
+    outbox: Vec<ClientMessage>,
     tui_pane_id: u64,
     attached_pane_id: Option<u64>,
     mode: Mode,
@@ -211,37 +73,16 @@ pub struct App {
 }
 
 impl App {
-    pub fn load<W: WeztermClient>(wezterm: &mut W) -> Result<Self> {
-        let repo_sources = load_repo_sources_from_config()?;
-        let projects = discover_projects_in(&repo_sources)?;
-        Self::load_with_projects_in(wezterm, repo_sources, projects)
-    }
-
-    #[cfg(test)]
-    fn load_with_projects<W: WeztermClient>(
-        wezterm: &mut W,
-        projects: Vec<ProjectEntry>,
-    ) -> Result<Self> {
-        let repo_sources = infer_repo_sources(&projects);
-        Self::load_with_projects_in(wezterm, repo_sources, projects)
-    }
-
-    fn load_with_projects_in<W: WeztermClient>(
-        wezterm: &mut W,
-        repo_sources: Vec<PathBuf>,
-        projects: Vec<ProjectEntry>,
-    ) -> Result<Self> {
-        let tui_pane_id = tui_pane_id_from_env()?;
-        let panes = wezterm.list_panes()?;
-
-        let mut app = Self {
+    fn default_local_state() -> Self {
+        Self {
             rows: Vec::new(),
+            workspace: WorkspaceSnapshot::default(),
             projects: Vec::new(),
             project_agent_monitors: Vec::new(),
             launched_agents: BTreeMap::new(),
-            selected_project_index: 0,
-            repo_sources,
-            tui_pane_id,
+            selected_project_id: None,
+            outbox: Vec::new(),
+            tui_pane_id: tui_pane_id_from_env().unwrap_or(0),
             attached_pane_id: None,
             mode: Mode::Normal,
             input_mode: None,
@@ -252,11 +93,46 @@ impl App {
             status_message: String::new(),
             last_error: None,
             should_quit: false,
-        };
-        app.replace_projects(projects, None);
+        }
+    }
+
+    #[cfg(test)]
+    fn load_with_projects<W: WeztermClient>(
+        wezterm: &mut W,
+        projects: Vec<ProjectEntry>,
+    ) -> Result<Self> {
+        let tui_pane_id = tui_pane_id_from_env()?;
+        let panes = wezterm.list_panes()?;
+
+        let mut app = Self::from_snapshot(workspace_snapshot_from_projects(&projects));
+        app.tui_pane_id = tui_pane_id;
         app.replace_rows(panes)?;
         app.set_status(format!("Loaded {} projects", app.projects.len()));
         Ok(app)
+    }
+
+    pub fn from_snapshot(snapshot: WorkspaceSnapshot) -> Self {
+        let selected_project_id = snapshot.project_order.first().cloned();
+        let project_agent_monitors = snapshot_agent_monitors(&snapshot);
+        Self {
+            projects: project_entries_from_snapshot(&snapshot),
+            project_agent_monitors,
+            workspace: snapshot,
+            selected_project_id,
+            ..Self::default_local_state()
+        }
+    }
+
+    pub fn replace_workspace(&mut self, snapshot: WorkspaceSnapshot) {
+        let previous = self.selected_project_id.clone();
+        self.workspace = snapshot;
+        self.projects = project_entries_from_snapshot(&self.workspace);
+        self.project_agent_monitors = vec![Vec::new(); self.projects.len()];
+        self.selected_project_id = previous.filter(|id| self.workspace.projects.contains_key(id));
+        if self.selected_project_id.is_none() {
+            self.selected_project_id = self.workspace.project_order.first().cloned();
+        }
+        self.refresh_project_agent_monitors();
     }
 
     pub fn projects(&self) -> &[ProjectEntry] {
@@ -270,8 +146,48 @@ impl App {
             .unwrap_or(&[])
     }
 
+    pub fn project_stale_reason(&self, project_index: usize) -> Option<&str> {
+        let project_id = self.workspace.project_order.get(project_index)?;
+        self.workspace
+            .projects
+            .get(project_id)?
+            .freshness
+            .stale_reason
+            .as_deref()
+    }
+
+    pub fn project_operation_text(&self, project_index: usize) -> Option<String> {
+        let project_id = self.workspace.project_order.get(project_index)?;
+        let operation = &self.workspace.projects.get(project_id)?.operation;
+        if operation.kind.is_empty() {
+            return None;
+        }
+
+        if operation.message.is_empty() {
+            Some(format!("op:{}", operation.kind))
+        } else {
+            Some(format!("op:{}[{}]", operation.kind, operation.message))
+        }
+    }
+
     pub fn selected_project_index(&self) -> usize {
-        self.selected_project_index
+        self.selected_project_id
+            .as_deref()
+            .and_then(|selected| {
+                self.workspace
+                    .project_order
+                    .iter()
+                    .position(|project_id| project_id == selected)
+            })
+            .unwrap_or(0)
+    }
+
+    pub fn selected_project_id(&self) -> Option<&str> {
+        self.selected_project_id.as_deref()
+    }
+
+    pub fn drain_outbox(&mut self) -> Vec<ClientMessage> {
+        mem::take(&mut self.outbox)
     }
 
     pub fn selected_project_cwd(&self) -> Option<&str> {
@@ -327,7 +243,13 @@ impl App {
         } else {
             "STATUS"
         };
-        format!("{prefix}: {message}")
+
+        let mut line = format!("{prefix}: {message}");
+        if let Some(warning) = self.workspace.warnings.last() {
+            line.push_str(" | WARN: ");
+            line.push_str(warning);
+        }
+        line
     }
 
     pub fn input_line(&self) -> String {
@@ -493,18 +415,20 @@ impl App {
     }
 
     fn selected_project(&self) -> Option<&ProjectEntry> {
-        self.projects.get(self.selected_project_index)
+        self.projects.get(self.selected_project_index())
     }
 
     fn project_move_up(&mut self) {
-        if !self.projects.is_empty() && self.selected_project_index > 0 {
-            self.selected_project_index -= 1;
+        let selected_project_index = self.selected_project_index();
+        if !self.projects.is_empty() && selected_project_index > 0 {
+            self.set_selected_project_index(selected_project_index - 1);
         }
     }
 
     fn project_move_down(&mut self) {
-        if !self.projects.is_empty() && self.selected_project_index + 1 < self.projects.len() {
-            self.selected_project_index += 1;
+        let selected_project_index = self.selected_project_index();
+        if !self.projects.is_empty() && selected_project_index + 1 < self.projects.len() {
+            self.set_selected_project_index(selected_project_index + 1);
         }
     }
 
@@ -681,7 +605,7 @@ impl App {
             self.record_error(format!("No projects match /{query}"));
             return;
         }
-        if matches.contains(&self.selected_project_index) {
+        if matches.contains(&self.selected_project_index()) {
             self.last_error = None;
             return;
         }
@@ -695,7 +619,7 @@ impl App {
             .copied()
             .find(|index| *index >= restore_index)
             .unwrap_or(matches[0]);
-        self.selected_project_index = target;
+        self.set_selected_project_index(target);
         self.last_error = None;
     }
 
@@ -715,7 +639,7 @@ impl App {
 
         let current_position = matches
             .iter()
-            .position(|index| *index == self.selected_project_index)
+            .position(|index| *index == self.selected_project_index())
             .or_else(|| {
                 let restore_index = restore_cwd
                     .as_deref()
@@ -730,7 +654,7 @@ impl App {
             (current_position + 1) % matches.len()
         };
 
-        self.selected_project_index = matches[target_position];
+        self.set_selected_project_index(matches[target_position]);
         self.last_error = None;
     }
 
@@ -765,42 +689,12 @@ impl App {
 
     fn restore_search_selection(&mut self, restore_cwd: Option<&str>) {
         if let Some(index) = restore_cwd.and_then(|cwd| self.project_index_by_cwd(cwd)) {
-            self.selected_project_index = index;
+            self.set_selected_project_index(index);
         }
     }
 
     fn project_index_by_cwd(&self, cwd: &str) -> Option<usize> {
         self.projects.iter().position(|project| project.cwd == cwd)
-    }
-
-    fn add_selected_worktree<W: WeztermClient>(
-        &mut self,
-        branch: &str,
-        wezterm: &mut W,
-    ) -> Result<()> {
-        let Some(project) = self.selected_project() else {
-            self.record_error("No projects found");
-            return Ok(());
-        };
-
-        let Some(branch) = normalize_worktree_branch_input(branch) else {
-            self.record_error("Worktree branch is empty");
-            return Ok(());
-        };
-
-        let root_cwd = project.root_cwd.clone();
-        let worktree_parent = worktree_parent_dir(project)?;
-        let target_cwd = generate_worktree_cwd(&worktree_parent)?;
-
-        run_git_worktree_add(&root_cwd, &branch, &target_cwd)?;
-
-        self.sync_tui(wezterm, Some(&target_cwd))?;
-        let worktree_name = Path::new(&target_cwd)
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| target_cwd.clone());
-        self.set_status(format!("Created worktree {worktree_name} on {branch}"));
-        Ok(())
     }
 
     fn execute_project_command<W: WeztermClient>(
@@ -814,36 +708,37 @@ impl App {
             return Ok(());
         }
 
-        let result = match parse_project_command(command)? {
-            ProjectCommand::Add { branch } => self.add_selected_worktree(&branch, wezterm),
-            ProjectCommand::Remove => self.remove_selected_worktree(wezterm),
-            ProjectCommand::Merge { target } => {
-                self.merge_selected_worktree(target.as_deref(), wezterm)?;
-                Ok(())
-            }
-            ProjectCommand::Pr { target } => {
-                self.create_pull_request_for_selected_worktree(target.as_deref(), wezterm)?;
-                Ok(())
-            }
-            ProjectCommand::Land { target } => {
-                self.merge_selected_worktree(target.as_deref(), wezterm)?;
-                self.remove_selected_worktree(wezterm)
-            }
-            ProjectCommand::Agent { runtime } => {
-                self.open_project_agent_tab(wezterm, runtime)?;
-                Ok(())
-            }
-            ProjectCommand::GitSwitch { branch } => {
-                self.switch_selected_root_branch(&branch, wezterm)
-            }
-            ProjectCommand::GitPull => self.pull_selected_root_project(wezterm),
-        };
-
-        if let Err(error) = &result {
-            self.record_error(error.to_string());
+        let parsed = parse_project_command(command)?;
+        if let Some(operation) = parsed.operation_name() {
+            let Some(project) = self.selected_project().cloned() else {
+                self.record_error("No projects found");
+                return Ok(());
+            };
+            self.outbox.push(ClientMessage::RunOperation {
+                project_id: self.selected_project_id().unwrap_or_default().to_string(),
+                operation: operation.to_string(),
+                command: command.to_string(),
+            });
+            self.set_status(format!("Queued {operation} for {}", project.name));
+            return Ok(());
         }
 
-        result
+        match parsed {
+            ProjectCommand::Agent { runtime } => {
+                if let Err(error) = self.open_project_agent_tab(wezterm, runtime) {
+                    self.record_error(error.to_string());
+                    return Err(error);
+                }
+                Ok(())
+            }
+            ProjectCommand::Add { .. }
+            | ProjectCommand::Remove
+            | ProjectCommand::Merge { .. }
+            | ProjectCommand::Pr { .. }
+            | ProjectCommand::Land { .. }
+            | ProjectCommand::GitSwitch { .. }
+            | ProjectCommand::GitPull => Ok(()),
+        }
     }
 
     fn advance_command_completion(&mut self, offset: isize) {
@@ -879,185 +774,6 @@ impl App {
 
         state.command = apply_completion(&state.command, &completion);
         self.refresh_command_input_state()
-    }
-
-    fn selected_linked_worktree(&self) -> Result<ProjectEntry> {
-        let project = self
-            .selected_project()
-            .cloned()
-            .ok_or_else(|| anyhow!("No projects found"))?;
-
-        if project.kind != ProjectKind::Worktree {
-            bail!("command only works on linked worktrees");
-        }
-        if matches!(project.branch.as_str(), "DETACHED" | "N/A") {
-            bail!("command requires a branch-backed worktree");
-        }
-
-        Ok(project)
-    }
-
-    fn selected_root_project(&self) -> Result<ProjectEntry> {
-        let project = self
-            .selected_project()
-            .cloned()
-            .ok_or_else(|| anyhow!("No projects found"))?;
-
-        if project.kind != ProjectKind::Root {
-            bail!("command only works on root projects");
-        }
-        if matches!(project.branch.as_str(), "DETACHED" | "N/A") {
-            bail!("command requires a branch-backed root project");
-        }
-
-        Ok(project)
-    }
-
-    fn switch_selected_root_branch<W: WeztermClient>(
-        &mut self,
-        branch: &str,
-        wezterm: &mut W,
-    ) -> Result<()> {
-        let project = self.selected_root_project().map_err(|error| {
-            if error
-                .to_string()
-                .contains("command only works on root projects")
-            {
-                anyhow!("git switch only works on root projects")
-            } else {
-                error
-            }
-        })?;
-        let branch = normalize_worktree_branch_input(branch)
-            .ok_or_else(|| anyhow!("git switch requires a branch name"))?;
-
-        switch_to_branch(&project.root_cwd, &branch)?;
-        self.sync_tui(wezterm, Some(&project.root_cwd))?;
-        self.set_status(format!("Switched {} to {branch}", project.name));
-        Ok(())
-    }
-
-    fn pull_selected_root_project<W: WeztermClient>(&mut self, wezterm: &mut W) -> Result<()> {
-        let project = self.selected_root_project().map_err(|error| {
-            if error
-                .to_string()
-                .contains("command only works on root projects")
-            {
-                anyhow!("git pull only works on root projects")
-            } else {
-                error
-            }
-        })?;
-
-        run_git(
-            &project.root_cwd,
-            &["pull"],
-            &format!("failed to pull updates for {}", project.root_cwd),
-        )?;
-        self.sync_tui(wezterm, Some(&project.root_cwd))?;
-        self.set_status(format!("Pulled updates for {}", project.name));
-        Ok(())
-    }
-
-    fn resolve_target_branch(
-        &self,
-        project: &ProjectEntry,
-        explicit_target: Option<&str>,
-    ) -> Result<String> {
-        match explicit_target
-            .map(str::trim)
-            .filter(|target| !target.is_empty())
-        {
-            Some(target) => Ok(target.to_string()),
-            None => default_target_branch(&project.root_cwd, &self.projects),
-        }
-    }
-
-    fn merge_destination_cwd(&self, project: &ProjectEntry, target: &str) -> String {
-        self.projects
-            .iter()
-            .find(|candidate| candidate.root_cwd == project.root_cwd && candidate.branch == target)
-            .map(|candidate| candidate.cwd.clone())
-            .unwrap_or_else(|| project.root_cwd.clone())
-    }
-
-    fn merge_selected_worktree<W: WeztermClient>(
-        &mut self,
-        explicit_target: Option<&str>,
-        wezterm: &mut W,
-    ) -> Result<()> {
-        let project = self.selected_linked_worktree()?;
-        let target = self.resolve_target_branch(&project, explicit_target)?;
-        if target == project.branch {
-            bail!("target branch matches selected worktree branch");
-        }
-
-        ensure_clean_worktree(&project.cwd, "selected worktree")?;
-
-        let merge_cwd = self.merge_destination_cwd(&project, &target);
-        ensure_clean_worktree(&merge_cwd, "target worktree")?;
-
-        switch_to_branch(&merge_cwd, &target)?;
-        fast_forward_target_from_remote(&merge_cwd, &target)?;
-        fast_forward_merge_branch(&merge_cwd, &project.branch, &target)?;
-
-        self.sync_tui(wezterm, Some(&project.cwd))?;
-        self.set_status(format!("Merged {} into {}", project.branch, target));
-        Ok(())
-    }
-
-    fn create_pull_request_for_selected_worktree<W: WeztermClient>(
-        &mut self,
-        explicit_target: Option<&str>,
-        wezterm: &mut W,
-    ) -> Result<()> {
-        let project = self.selected_linked_worktree()?;
-        let target = self.resolve_target_branch(&project, explicit_target)?;
-        if target == project.branch {
-            bail!("target branch matches selected worktree branch");
-        }
-
-        ensure_clean_worktree(&project.cwd, "selected worktree")?;
-
-        let remote = branch_remote(&project.cwd, &project.branch)?
-            .ok_or_else(|| anyhow!("no git remote configured for {}", project.branch))?;
-        push_branch_to_remote(&project.cwd, &remote, &project.branch)?;
-        let pr_url = ensure_pull_request(&project.cwd, &project.branch, &target)?;
-
-        self.sync_tui(wezterm, Some(&project.cwd))?;
-        self.set_status(format!(
-            "PR ready for {} -> {}: {}",
-            project.branch, target, pr_url
-        ));
-        Ok(())
-    }
-
-    fn remove_selected_worktree<W: WeztermClient>(&mut self, wezterm: &mut W) -> Result<()> {
-        let project = self.selected_linked_worktree().map_err(|error| {
-            if error
-                .to_string()
-                .contains("command only works on linked worktrees")
-            {
-                anyhow!("remove only works on linked worktrees")
-            } else if error
-                .to_string()
-                .contains("command requires a branch-backed worktree")
-            {
-                anyhow!("remove requires a branch-backed worktree")
-            } else {
-                error
-            }
-        })?;
-
-        run_git_worktree_remove(&project.root_cwd, &project.cwd)?;
-        run_git_branch_delete(&project.root_cwd, &project.branch)?;
-
-        self.sync_tui(wezterm, Some(&project.root_cwd))?;
-        self.set_status(format!(
-            "Removed worktree {} and branch {}",
-            project.name, project.branch
-        ));
-        Ok(())
     }
 
     fn attach_project_agent<W: WeztermClient>(&mut self, wezterm: &mut W) -> Result<()> {
@@ -1131,6 +847,25 @@ impl App {
             .iter()
             .position(|monitor| monitor.state == AgentMonitorState::NeedsInput)
             .or(Some(0))
+    }
+
+    fn best_attachable_agent(&self) -> Option<(usize, usize)> {
+        let mut first_available = None;
+
+        for (project_index, monitors) in self.project_agent_monitors.iter().enumerate() {
+            if let Some(agent_index) = monitors
+                .iter()
+                .position(|monitor| monitor.state == AgentMonitorState::NeedsInput)
+            {
+                return Some((project_index, agent_index));
+            }
+
+            if first_available.is_none() && !monitors.is_empty() {
+                first_available = Some((project_index, 0));
+            }
+        }
+
+        first_available
     }
 
     fn attached_project_agent_position(&self) -> Option<(usize, usize)> {
@@ -1444,48 +1179,17 @@ impl App {
         Ok(())
     }
 
-    fn sync_tui<W: WeztermClient>(
-        &mut self,
-        wezterm: &mut W,
-        selected_cwd: Option<&str>,
-    ) -> Result<()> {
-        self.reload_projects(selected_cwd)?;
-        self.refresh(wezterm)
-    }
-
-    fn reload_projects(&mut self, selected_cwd: Option<&str>) -> Result<()> {
-        let projects = discover_projects_in(&self.repo_sources)?;
-        self.replace_projects(projects, selected_cwd);
-        self.refresh_project_agent_monitors();
-        Ok(())
-    }
-
-    fn replace_projects(&mut self, projects: Vec<ProjectEntry>, selected_cwd: Option<&str>) {
-        let previous_selection = selected_cwd
-            .map(str::to_string)
-            .or_else(|| self.selected_project().map(|project| project.cwd.clone()));
-        self.projects = projects;
-        self.selected_project_index = previous_selection
-            .as_deref()
-            .and_then(|cwd| self.projects.iter().position(|project| project.cwd == cwd))
-            .unwrap_or(0);
-
-        if self.selected_project_index >= self.projects.len() {
-            self.selected_project_index = self.projects.len().saturating_sub(1);
-        }
-
-        self.project_agent_monitors = vec![Vec::new(); self.projects.len()];
+    fn set_selected_project_index(&mut self, index: usize) {
+        self.selected_project_id = self.workspace.project_order.get(index).cloned();
     }
 
     fn refresh_project_agent_monitors(&mut self) {
-        let mut monitors = vec![Vec::new(); self.projects.len()];
-        let pane_monitors = load_pane_agent_monitors(&self.rows);
+        let mut monitors = snapshot_agent_monitors(&self.workspace);
         let mut monitored_pane_ids = BTreeSet::new();
 
-        for (pane_cwd, monitor) in pane_monitors {
-            monitored_pane_ids.insert(monitor.pane_id);
-            if let Some(project_index) = project_index_for_cwd(&self.projects, &pane_cwd) {
-                monitors[project_index].push(monitor);
+        for project_monitors in &monitors {
+            for monitor in project_monitors {
+                monitored_pane_ids.insert(monitor.pane_id);
             }
         }
 
@@ -1531,489 +1235,6 @@ impl App {
     }
 }
 
-#[cfg(test)]
-fn infer_repo_sources(projects: &[ProjectEntry]) -> Vec<PathBuf> {
-    let mut repo_sources = BTreeMap::new();
-
-    for project in projects {
-        let Some(path) = Path::new(&project.root_cwd).parent() else {
-            continue;
-        };
-        repo_sources
-            .entry(path.to_string_lossy().into_owned())
-            .or_insert_with(|| path.to_path_buf());
-    }
-
-    repo_sources.into_values().collect()
-}
-
-fn discover_projects_in(repo_sources: &[PathBuf]) -> Result<Vec<ProjectEntry>> {
-    let mut probes = BTreeMap::new();
-
-    for repo_source in repo_sources {
-        for entry in fs::read_dir(repo_source)
-            .with_context(|| format!("failed to read repo source {}", repo_source.display()))?
-        {
-            let entry = entry
-                .with_context(|| format!("failed to read entry in {}", repo_source.display()))?;
-            let path = entry.path();
-            if !path.is_dir() {
-                continue;
-            }
-
-            if let Some(probe) = inspect_git_project(&path)? {
-                probes.entry(probe.cwd.clone()).or_insert(probe);
-            }
-        }
-    }
-
-    Ok(build_project_entries(probes.into_values().collect()))
-}
-
-fn home_dir_from_env() -> Result<PathBuf> {
-    let home = env::var("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home))
-}
-
-fn config_path_from_home(home: &Path) -> PathBuf {
-    home.join(".config/nerve_center/config.toml")
-}
-
-fn load_repo_sources_from_config() -> Result<Vec<PathBuf>> {
-    let home = home_dir_from_env()?;
-    let config_path = config_path_from_home(&home);
-    load_repo_sources_from_config_at(&config_path, &home)
-}
-
-fn load_repo_sources_from_config_at(config_path: &Path, home: &Path) -> Result<Vec<PathBuf>> {
-    ensure_repo_config_exists(config_path)?;
-
-    let content = fs::read_to_string(config_path)
-        .with_context(|| format!("failed to read {}", config_path.display()))?;
-    let config: AppConfig = toml::from_str(&content)
-        .with_context(|| format!("failed to parse {}", config_path.display()))?;
-    normalize_repo_sources(&config.repo_sources, home)
-}
-
-fn ensure_repo_config_exists(config_path: &Path) -> Result<()> {
-    if config_path.exists() {
-        return Ok(());
-    }
-
-    let parent = config_path
-        .parent()
-        .ok_or_else(|| anyhow!("{} has no parent directory", config_path.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    fs::write(config_path, default_repo_config())
-        .with_context(|| format!("failed to write {}", config_path.display()))?;
-    Ok(())
-}
-
-fn default_repo_config() -> String {
-    format!("repo_sources = [\"{}\"]\n", DEFAULT_REPO_SOURCE)
-}
-
-fn normalize_repo_sources(repo_sources: &[String], home: &Path) -> Result<Vec<PathBuf>> {
-    if repo_sources.is_empty() {
-        bail!("repo_sources must contain at least one directory")
-    }
-
-    let mut normalized = BTreeMap::new();
-    for repo_source in repo_sources {
-        let path = expand_home_path(repo_source, home);
-        if !path.exists() {
-            bail!("configured repo source does not exist: {}", path.display())
-        }
-        if !path.is_dir() {
-            bail!(
-                "configured repo source is not a directory: {}",
-                path.display()
-            )
-        }
-
-        let canonical = path
-            .canonicalize()
-            .with_context(|| format!("failed to resolve {}", path.display()))?;
-        normalized
-            .entry(canonical.to_string_lossy().into_owned())
-            .or_insert(canonical);
-    }
-
-    Ok(normalized.into_values().collect())
-}
-
-fn expand_home_path(path: &str, home: &Path) -> PathBuf {
-    if path == "~" {
-        return home.to_path_buf();
-    }
-
-    if let Some(rest) = path.strip_prefix("~/") {
-        return home.join(rest);
-    }
-
-    PathBuf::from(path)
-}
-
-fn worktree_parent_dir(project: &ProjectEntry) -> Result<PathBuf> {
-    Path::new(&project.root_cwd)
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| anyhow!("{} has no parent directory", project.root_cwd))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GitProjectProbe {
-    name: String,
-    cwd: String,
-    branch: String,
-    status_summary: ProjectStatusSummary,
-    root_name: String,
-    root_cwd: String,
-    common_dir: String,
-    is_root: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GitStatusProbe {
-    branch: String,
-    status_summary: ProjectStatusSummary,
-}
-
-fn inspect_git_project(path: &Path) -> Result<Option<GitProjectProbe>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args([
-            "rev-parse",
-            "--show-toplevel",
-            "--git-dir",
-            "--git-common-dir",
-        ])
-        .output()
-        .with_context(|| format!("failed to inspect git metadata for {}", path.display()))?;
-
-    if !output.status.success() {
-        return Ok(None);
-    }
-
-    let stdout =
-        String::from_utf8(output.stdout).context("git rev-parse stdout was not valid UTF-8")?;
-    let mut lines = stdout.lines();
-    let cwd = lines
-        .next()
-        .context("git rev-parse missing --show-toplevel output")?
-        .trim()
-        .to_string();
-    let git_dir = lines
-        .next()
-        .context("git rev-parse missing --git-dir output")?
-        .trim()
-        .to_string();
-    let common_dir = lines
-        .next()
-        .context("git rev-parse missing --git-common-dir output")?
-        .trim()
-        .to_string();
-
-    let cwd_path = PathBuf::from(&cwd);
-    let git_dir = resolve_git_path(&cwd_path, &git_dir);
-    let common_dir = resolve_git_path(&cwd_path, &common_dir);
-    let root_cwd = common_dir
-        .parent()
-        .context("git common dir did not have a parent directory")?
-        .to_path_buf();
-    let root_name = root_cwd
-        .file_name()
-        .context("git root did not have a final path component")?
-        .to_string_lossy()
-        .into_owned();
-    let cwd_name = cwd_path
-        .file_name()
-        .context("project path did not have a final path component")?
-        .to_string_lossy()
-        .into_owned();
-    let status = read_project_status(path)?;
-    let is_root = git_dir == common_dir;
-    let name = if is_root || matches!(status.branch.as_str(), "DETACHED" | "N/A") {
-        cwd_name
-    } else {
-        status.branch.clone()
-    };
-
-    Ok(Some(GitProjectProbe {
-        name,
-        cwd,
-        branch: status.branch,
-        status_summary: status.status_summary,
-        root_name,
-        root_cwd: root_cwd.to_string_lossy().into_owned(),
-        common_dir: common_dir.to_string_lossy().into_owned(),
-        is_root,
-    }))
-}
-
-fn resolve_git_path(base: &Path, git_path: &str) -> PathBuf {
-    let path = Path::new(git_path);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        base.join(path)
-    }
-}
-
-fn read_branch_name(path: &Path) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["branch", "--show-current"])
-        .output()
-        .with_context(|| format!("failed to read branch for {}", path.display()))?;
-
-    if !output.status.success() {
-        return Ok("N/A".to_string());
-    }
-
-    let branch = String::from_utf8(output.stdout)
-        .context("git branch stdout was not valid UTF-8")?
-        .trim()
-        .to_string();
-    if branch.is_empty() {
-        Ok("DETACHED".to_string())
-    } else {
-        Ok(branch)
-    }
-}
-
-fn read_project_status(path: &Path) -> Result<GitStatusProbe> {
-    let output = Command::new("git")
-        .arg("--no-optional-locks")
-        .arg("-C")
-        .arg(path)
-        .args(["status", "--porcelain=v2", "--branch"])
-        .output()
-        .with_context(|| format!("failed to read git status for {}", path.display()))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!(
-            "git status failed for {}: {}",
-            path.display(),
-            stderr.trim()
-        );
-    }
-
-    let stdout =
-        String::from_utf8(output.stdout).context("git status stdout was not valid UTF-8")?;
-    parse_project_status_output(&stdout)
-}
-
-fn parse_project_status_output(stdout: &str) -> Result<GitStatusProbe> {
-    let mut branch = "N/A".to_string();
-    let mut status_summary = ProjectStatusSummary::default();
-
-    for line in stdout.lines() {
-        if let Some(head) = line.strip_prefix("# branch.head ") {
-            branch = if head == "(detached)" {
-                "DETACHED".to_string()
-            } else {
-                head.to_string()
-            };
-            continue;
-        }
-
-        if let Some(counts) = line.strip_prefix("# branch.ab +") {
-            let (ahead, behind) = counts
-                .split_once(" -")
-                .context("git status branch.ab header was malformed")?;
-            status_summary.ahead = ahead
-                .parse()
-                .context("git status ahead count was not a number")?;
-            status_summary.behind = behind
-                .parse()
-                .context("git status behind count was not a number")?;
-            continue;
-        }
-
-        if line.starts_with("u ") {
-            status_summary.conflicts += 1;
-            continue;
-        }
-
-        if line.starts_with("? ") {
-            status_summary.untracked += 1;
-            continue;
-        }
-
-        if !matches!(line.as_bytes().first(), Some(b'1' | b'2')) {
-            continue;
-        }
-
-        let xy = line
-            .split_whitespace()
-            .nth(1)
-            .context("git status record missing XY field")?;
-        let mut xy_chars = xy.chars();
-        let staged_status = xy_chars
-            .next()
-            .context("git status XY field was missing staged status")?;
-        let worktree_status = xy_chars
-            .next()
-            .context("git status XY field was missing worktree status")?;
-        if xy_chars.next().is_some() {
-            bail!("git status XY field was longer than expected");
-        }
-
-        if staged_status != '.' {
-            status_summary.staged += 1;
-        }
-        if staged_status == 'D' || worktree_status == 'D' {
-            status_summary.deleted += 1;
-        }
-        if worktree_status != '.' && worktree_status != 'D' {
-            status_summary.modified += 1;
-        }
-    }
-
-    Ok(GitStatusProbe {
-        branch,
-        status_summary,
-    })
-}
-
-fn build_project_entries(probes: Vec<GitProjectProbe>) -> Vec<ProjectEntry> {
-    let mut groups = BTreeMap::<String, Vec<GitProjectProbe>>::new();
-    for probe in probes {
-        groups
-            .entry(probe.common_dir.clone())
-            .or_default()
-            .push(probe);
-    }
-
-    let mut groups = groups.into_values().collect::<Vec<_>>();
-    groups.sort_by(|left, right| left[0].root_name.cmp(&right[0].root_name));
-
-    let mut projects = Vec::new();
-    for mut group in groups {
-        group.sort_by(|left, right| match (left.is_root, right.is_root) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => left.name.cmp(&right.name),
-        });
-
-        for probe in group {
-            projects.push(ProjectEntry {
-                name: probe.name,
-                cwd: probe.cwd,
-                branch: probe.branch,
-                status_summary: probe.status_summary,
-                root_name: probe.root_name,
-                root_cwd: probe.root_cwd,
-                kind: if probe.is_root {
-                    ProjectKind::Root
-                } else {
-                    ProjectKind::Worktree
-                },
-            });
-        }
-    }
-
-    projects
-}
-
-fn agent_state_dir_from_env() -> Result<PathBuf> {
-    if let Ok(path) = env::var("NERVE_CENTER_DATA_DIR") {
-        return Ok(PathBuf::from(path));
-    }
-
-    let home = env::var("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".local/data/nerve_center"))
-}
-
-fn load_pane_agent_monitors(rows: &[PaneRow]) -> Vec<(String, ProjectAgentMonitor)> {
-    let Ok(agent_state_dir) = agent_state_dir_from_env() else {
-        return Vec::new();
-    };
-    let Ok(entries) = fs::read_dir(agent_state_dir) else {
-        return Vec::new();
-    };
-
-    let pane_cwds = rows
-        .iter()
-        .filter_map(|row| normalize_pane_cwd(&row.pane.cwd).map(|cwd| (row.pane.pane_id, cwd)))
-        .collect::<BTreeMap<_, _>>();
-
-    let mut monitors = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-
-        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-            continue;
-        };
-        let Ok(pane_id) = file_name.parse::<u64>() else {
-            continue;
-        };
-        let Some(pane_cwd) = pane_cwds.get(&pane_id) else {
-            continue;
-        };
-        let Some(monitor) = read_pane_agent_monitor(&path, pane_id) else {
-            continue;
-        };
-
-        monitors.push((pane_cwd.clone(), monitor));
-    }
-
-    monitors
-}
-
-fn read_pane_agent_monitor(path: &Path, pane_id: u64) -> Option<ProjectAgentMonitor> {
-    let content = fs::read_to_string(path).ok()?;
-    let json: Value = serde_json::from_str(&content).ok()?;
-    let runtime = json
-        .get("runtime")
-        .and_then(Value::as_str)
-        .or_else(|| json.get("source").and_then(Value::as_str))
-        .and_then(AgentRuntime::from_state_name)?;
-    let state = infer_agent_monitor_state(&json)?;
-
-    Some(ProjectAgentMonitor {
-        pane_id,
-        runtime,
-        state,
-    })
-}
-
-fn infer_agent_monitor_state(json: &Value) -> Option<AgentMonitorState> {
-    if json
-        .get("awaiting_user")
-        .is_some_and(|value| !value.is_null())
-    {
-        return Some(AgentMonitorState::NeedsInput);
-    }
-
-    json.get("effective_state")
-        .and_then(Value::as_str)
-        .and_then(AgentMonitorState::from_state_name)
-        .or_else(|| {
-            json.get("state")
-                .and_then(Value::as_str)
-                .and_then(AgentMonitorState::from_state_name)
-        })
-        .or_else(|| {
-            json.get("main")
-                .and_then(|main| main.get("state"))
-                .and_then(Value::as_str)
-                .and_then(AgentMonitorState::from_state_name)
-        })
-}
-
-fn normalize_pane_cwd(cwd: &str) -> Option<String> {
-    let cwd = cwd.strip_prefix("file://").unwrap_or(cwd);
-    (!cwd.is_empty()).then(|| cwd.trim_end_matches('/').to_string())
-}
-
 fn project_index_for_cwd(projects: &[ProjectEntry], cwd: &str) -> Option<usize> {
     projects
         .iter()
@@ -2030,131 +1251,6 @@ fn project_index_for_cwd(projects: &[ProjectEntry], cwd: &str) -> Option<usize> 
         })
         .max_by_key(|(_, match_len)| *match_len)
         .map(|(index, _)| index)
-}
-
-fn default_target_branch(root_cwd: &str, projects: &[ProjectEntry]) -> Result<String> {
-    if let Some(branch) = remote_default_branch(root_cwd)? {
-        return Ok(branch);
-    }
-
-    for branch in ["main", "master"] {
-        if local_branch_exists(root_cwd, branch)? {
-            return Ok(branch.to_string());
-        }
-    }
-
-    if let Some(branch) = projects.iter().find_map(|project| {
-        (project.root_cwd == root_cwd
-            && project.kind == ProjectKind::Root
-            && !matches!(project.branch.as_str(), "DETACHED" | "N/A"))
-        .then(|| project.branch.clone())
-    }) {
-        return Ok(branch);
-    }
-
-    bail!("could not determine default branch for {root_cwd}")
-}
-
-fn remote_default_branch(root_cwd: &str) -> Result<Option<String>> {
-    let output = Command::new("git")
-        .args([
-            "-C",
-            root_cwd,
-            "symbolic-ref",
-            "--quiet",
-            "--short",
-            "refs/remotes/origin/HEAD",
-        ])
-        .output()
-        .with_context(|| format!("failed to inspect remote default branch for {root_cwd}"))?;
-
-    if !output.status.success() {
-        return Ok(None);
-    }
-
-    let branch = String::from_utf8(output.stdout)
-        .context("git symbolic-ref stdout was not valid UTF-8")?
-        .trim()
-        .to_string();
-    Ok(branch.rsplit('/').next().map(str::to_string))
-}
-
-fn local_branch_exists(root_cwd: &str, branch: &str) -> Result<bool> {
-    let status = Command::new("git")
-        .args([
-            "-C",
-            root_cwd,
-            "show-ref",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{branch}"),
-        ])
-        .status()
-        .with_context(|| format!("failed to inspect branch {branch} in {root_cwd}"))?;
-    Ok(status.success())
-}
-
-fn ensure_clean_worktree(cwd: &str, label: &str) -> Result<()> {
-    let output = Command::new("git")
-        .args(["-C", cwd, "status", "--porcelain"])
-        .output()
-        .with_context(|| format!("failed to read git status for {cwd}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("git status failed for {cwd}: {}", stderr.trim());
-    }
-
-    let status =
-        String::from_utf8(output.stdout).context("git status stdout was not valid UTF-8")?;
-    if status.trim().is_empty() {
-        return Ok(());
-    }
-
-    bail!("{label} has uncommitted or untracked changes")
-}
-
-fn switch_to_branch(cwd: &str, branch: &str) -> Result<()> {
-    if read_branch_name(Path::new(cwd))? == branch {
-        return Ok(());
-    }
-
-    if local_branch_exists(cwd, branch)? {
-        return run_git(
-            cwd,
-            &["switch", branch],
-            &format!("failed to switch {cwd} to {branch}"),
-        );
-    }
-
-    if let Some((remote, remote_branch)) = split_remote_branch(branch) {
-        if local_branch_exists(cwd, remote_branch)? {
-            return run_git(
-                cwd,
-                &["switch", remote_branch],
-                &format!("failed to switch {cwd} to {remote_branch}"),
-            );
-        }
-
-        if remote_tracking_ref_exists(cwd, remote, remote_branch)? {
-            return run_git(
-                cwd,
-                &["switch", "--track", "-c", remote_branch, branch],
-                &format!("failed to switch {cwd} to tracking branch {branch}"),
-            );
-        }
-    }
-
-    run_git(
-        cwd,
-        &["switch", branch],
-        &format!("failed to switch {cwd} to {branch}"),
-    )
-}
-
-fn split_remote_branch(branch: &str) -> Option<(&str, &str)> {
-    let (remote, remote_branch) = branch.split_once('/')?;
-    (!remote.is_empty() && !remote_branch.is_empty()).then_some((remote, remote_branch))
 }
 
 fn should_apply_completion_on_confirm(
@@ -2187,237 +1283,106 @@ fn current_command_token(command: &str) -> &str {
     command.split_whitespace().last().unwrap_or("")
 }
 
-fn branch_remote(cwd: &str, branch: &str) -> Result<Option<String>> {
-    let output = Command::new("git")
-        .args([
-            "-C",
-            cwd,
-            "config",
-            "--get",
-            &format!("branch.{branch}.remote"),
-        ])
-        .output()
-        .with_context(|| format!("failed to inspect remote for branch {branch} in {cwd}"))?;
-
-    if output.status.success() {
-        let remote = String::from_utf8(output.stdout)
-            .context("git config stdout was not valid UTF-8")?
-            .trim()
-            .to_string();
-        if !remote.is_empty() {
-            return Ok(Some(remote));
-        }
-    }
-
-    let remotes = Command::new("git")
-        .args(["-C", cwd, "remote"])
-        .output()
-        .with_context(|| format!("failed to list remotes for {cwd}"))?;
-    if !remotes.status.success() {
-        return Ok(None);
-    }
-
-    let stdout =
-        String::from_utf8(remotes.stdout).context("git remote stdout was not valid UTF-8")?;
-    Ok(stdout
-        .lines()
-        .find(|remote| *remote == "origin")
-        .map(str::to_string))
-}
-
-fn remote_tracking_ref_exists(cwd: &str, remote: &str, branch: &str) -> Result<bool> {
-    let status = Command::new("git")
-        .args([
-            "-C",
-            cwd,
-            "show-ref",
-            "--verify",
-            "--quiet",
-            &format!("refs/remotes/{remote}/{branch}"),
-        ])
-        .status()
-        .with_context(|| format!("failed to inspect remote branch {remote}/{branch} in {cwd}"))?;
-    Ok(status.success())
-}
-
-fn fast_forward_target_from_remote(cwd: &str, target: &str) -> Result<()> {
-    let Some(remote) = branch_remote(cwd, target)? else {
-        return Ok(());
-    };
-
-    run_git(
-        cwd,
-        &["fetch", &remote, target],
-        &format!("failed to fetch {remote}/{target} for {cwd}"),
-    )?;
-
-    if !remote_tracking_ref_exists(cwd, &remote, target)? {
-        return Ok(());
-    }
-
-    let remote_ref = format!("{remote}/{target}");
-    run_git(
-        cwd,
-        &["merge", "--ff-only", &remote_ref],
-        &format!("failed to fast-forward {target} from {remote_ref}"),
-    )
-}
-
-fn fast_forward_merge_branch(cwd: &str, source_branch: &str, target: &str) -> Result<()> {
-    run_git(
-        cwd,
-        &["merge", "--ff-only", source_branch],
-        &format!("failed to fast-forward merge {source_branch} into {target}"),
-    )
-}
-
-fn push_branch_to_remote(cwd: &str, remote: &str, branch: &str) -> Result<()> {
-    run_git(
-        cwd,
-        &["push", "-u", remote, branch],
-        &format!("failed to push {branch} to {remote}"),
-    )
-}
-
-fn ensure_pull_request(cwd: &str, branch: &str, target: &str) -> Result<String> {
-    if let Some(url) = existing_pull_request_url(cwd)? {
-        return Ok(url);
-    }
-
-    run_gh_capture(
-        cwd,
-        &["pr", "create", "--base", target, "--head", branch, "--fill"],
-        &format!("failed to create PR for {branch} -> {target}"),
-    )
-    .map(|url| url.trim().to_string())
-}
-
-fn existing_pull_request_url(cwd: &str) -> Result<Option<String>> {
-    let output = Command::new("gh")
-        .args(["pr", "view", "--json", "url", "--jq", ".url"])
-        .current_dir(cwd)
-        .output()
-        .with_context(|| format!("failed to inspect PR state for {cwd}"))?;
-
-    if !output.status.success() {
-        return Ok(None);
-    }
-
-    let url = String::from_utf8(output.stdout)
-        .context("gh pr view stdout was not valid UTF-8")?
-        .trim()
-        .to_string();
-    if url.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(url))
-    }
-}
-
-fn run_git(cwd: &str, args: &[&str], failure_context: &str) -> Result<()> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .with_context(|| failure_context.to_string())?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    bail!("{failure_context}: {}", stderr.trim())
-}
-
-fn run_gh_capture(cwd: &str, args: &[&str], failure_context: &str) -> Result<String> {
-    let output = Command::new("gh")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .with_context(|| failure_context.to_string())?;
-
-    if output.status.success() {
-        return String::from_utf8(output.stdout)
-            .context("gh stdout was not valid UTF-8")
-            .map(|stdout| stdout.trim().to_string());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    bail!("{failure_context}: {}", stderr.trim())
-}
-
 fn normalize_worktree_branch_input(input: &str) -> Option<String> {
     let branch = input.trim();
     (!branch.is_empty()).then(|| branch.to_string())
 }
 
-fn generate_worktree_cwd(parent_dir: &Path) -> Result<String> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before unix epoch")?;
-    let base = format!(
-        "wt-{}-{:03}-{}",
-        now.as_secs(),
-        now.subsec_millis(),
-        std::process::id()
-    );
+fn project_entries_from_snapshot(snapshot: &WorkspaceSnapshot) -> Vec<ProjectEntry> {
+    snapshot
+        .project_order
+        .iter()
+        .filter_map(|project_id| {
+            let project = snapshot.projects.get(project_id)?;
+            let root = snapshot.projects.get(&project.root_id).unwrap_or(project);
 
-    for attempt in 0..1000 {
-        let name = if attempt == 0 {
-            base.clone()
-        } else {
-            format!("{base}-{attempt}")
+            Some(ProjectEntry {
+                name: project.name.clone(),
+                cwd: project.cwd.clone(),
+                branch: project.git.branch.clone(),
+                status_summary: project.git.status_summary.clone(),
+                root_name: root.name.clone(),
+                root_cwd: root.cwd.clone(),
+                kind: project.kind.clone(),
+            })
+        })
+        .collect()
+}
+
+fn snapshot_agent_monitors(snapshot: &WorkspaceSnapshot) -> Vec<Vec<ProjectAgentMonitor>> {
+    let mut monitors = vec![Vec::new(); snapshot.project_order.len()];
+
+    for (project_index, project_id) in snapshot.project_order.iter().enumerate() {
+        let Some(project) = snapshot.projects.get(project_id) else {
+            continue;
         };
-        let cwd = parent_dir.join(&name);
-        if !cwd.exists() {
-            return Ok(cwd.to_string_lossy().into_owned());
+
+        for agent in &project.agents {
+            let Some(pane_id) = agent.pane_id else {
+                continue;
+            };
+            let Some(runtime) = AgentRuntime::from_state_name(&agent.runtime) else {
+                continue;
+            };
+            let Some(state) = snapshot_agent_monitor_state(&agent.status) else {
+                continue;
+            };
+
+            monitors[project_index].push(ProjectAgentMonitor {
+                pane_id,
+                runtime,
+                state,
+            });
         }
+
+        monitors[project_index].sort_by_key(|monitor| {
+            (
+                monitor.runtime.short_label().to_string(),
+                monitor.pane_id,
+                monitor.state.short_code(),
+            )
+        });
     }
 
-    bail!("failed to allocate a unique worktree directory name")
+    monitors
 }
 
-fn run_git_worktree_add(root_cwd: &str, slug: &str, target_cwd: &str) -> Result<()> {
-    let output = Command::new("git")
-        .args(["-C", root_cwd, "worktree", "add", "-b", slug, target_cwd])
-        .output()
-        .with_context(|| format!("failed to create worktree from {root_cwd}"))?;
-
-    if output.status.success() {
-        return Ok(());
+fn snapshot_agent_monitor_state(status: &str) -> Option<AgentMonitorState> {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "starting" => Some(AgentMonitorState::Starting),
+        "working" | "busy" | "running" | "retry" => Some(AgentMonitorState::Working),
+        "needs_input" | "needs-input" | "input" | "awaiting_user" | "awaiting-user" => {
+            Some(AgentMonitorState::NeedsInput)
+        }
+        "done" | "idle" | "complete" | "completed" => Some(AgentMonitorState::Done),
+        "error" | "failed" => Some(AgentMonitorState::Error),
+        _ => None,
     }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    bail!("git worktree add failed: {}", stderr.trim())
 }
 
-fn run_git_worktree_remove(root_cwd: &str, target_cwd: &str) -> Result<()> {
-    let output = Command::new("git")
-        .args(["-C", root_cwd, "worktree", "remove", target_cwd])
-        .output()
-        .with_context(|| format!("failed to remove worktree {target_cwd}"))?;
-
-    if output.status.success() {
-        return Ok(());
+fn workspace_snapshot_from_projects(projects: &[ProjectEntry]) -> WorkspaceSnapshot {
+    let mut snapshot = WorkspaceSnapshot::default();
+    snapshot.protocol_version = 1;
+    snapshot.project_order = projects.iter().map(|project| project.cwd.clone()).collect();
+    for project in projects {
+        snapshot.projects.insert(
+            project.cwd.clone(),
+            crate::workspace::ProjectSnapshot {
+                id: project.cwd.clone(),
+                name: project.name.clone(),
+                cwd: project.cwd.clone(),
+                root_id: project.root_cwd.clone(),
+                kind: project.kind.clone(),
+                git: crate::workspace::ProjectGitState {
+                    branch: project.branch.clone(),
+                    status: project.status_summary.display_text(),
+                    status_summary: project.status_summary.clone(),
+                },
+                ..crate::workspace::ProjectSnapshot::default()
+            },
+        );
     }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    bail!("git worktree remove failed: {}", stderr.trim())
-}
-
-fn run_git_branch_delete(root_cwd: &str, branch: &str) -> Result<()> {
-    let output = Command::new("git")
-        .args(["-C", root_cwd, "branch", "-d", branch])
-        .output()
-        .with_context(|| format!("failed to delete branch {branch} from {root_cwd}"))?;
-
-    if output.status.success() {
-        return Ok(());
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    bail!("git branch -d failed: {}", stderr.trim())
+    snapshot
 }
 
 #[cfg(test)]
@@ -2433,12 +1398,14 @@ mod tests {
     use anyhow::Result;
 
     use super::{
-        App, GitProjectProbe, Mode, ProjectEntry, ProjectKind, ProjectStatusSummary,
-        build_project_entries, parse_project_command, parse_project_status_output,
-        run_git_branch_delete, run_git_worktree_remove,
+        build_project_entries, parse_project_command, parse_project_status_output, App,
+        GitProjectProbe, Mode, ProjectEntry, ProjectKind, ProjectStatusSummary,
     };
+    use crate::daemon::protocol::ClientMessage;
     use crate::input::AppAction;
+    use crate::projects::{run_git_branch_delete, run_git_worktree_remove};
     use crate::wezterm::{PaneInfo, SpawnCommand, SplitDirection, WeztermClient};
+    use crate::workspace::{AgentSnapshot, WorkspaceSnapshot};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -2633,6 +1600,43 @@ mod tests {
         ]
     }
 
+    fn test_snapshot_with_agents(
+        agent_specs: Vec<(&str, Vec<(&str, u64, &str)>)>,
+    ) -> WorkspaceSnapshot {
+        let mut snapshot = super::workspace_snapshot_from_projects(&test_projects());
+
+        for (project_name, agents) in agent_specs {
+            let project = test_projects()
+                .into_iter()
+                .find(|project| project.name == project_name)
+                .expect("test project should exist");
+            let project_snapshot = snapshot
+                .projects
+                .get_mut(&project.cwd)
+                .expect("project snapshot should exist");
+            project_snapshot.agents = agents
+                .into_iter()
+                .map(|(runtime, pane_id, status)| AgentSnapshot {
+                    runtime: runtime.to_string(),
+                    pane_id: Some(pane_id),
+                    status: status.to_string(),
+                })
+                .collect();
+        }
+
+        snapshot.generated_at_ms = 1;
+        snapshot
+    }
+
+    fn load_test_app_with_agents(
+        wezterm: &mut FakeWezterm,
+        agent_specs: Vec<(&str, Vec<(&str, u64, &str)>)>,
+    ) -> App {
+        let mut app = App::load_with_projects(wezterm, test_projects()).expect("app should load");
+        app.replace_workspace(test_snapshot_with_agents(agent_specs));
+        app
+    }
+
     fn search_test_projects() -> Vec<ProjectEntry> {
         vec![
             ProjectEntry {
@@ -2771,29 +1775,19 @@ mod tests {
 
     #[test]
     fn command_errors_persist_across_background_refresh() {
-        let sandbox = test_sandbox("command-error-status-persist");
-        let root = create_repo_in(&sandbox, "repo");
-        let projects = super::discover_projects_in(std::slice::from_ref(&sandbox))
-            .expect("projects should be discovered");
-
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
-        let mut app = App::load_with_projects(&mut wezterm, projects).expect("app should load");
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
 
-        let error = app
-            .execute_project_command("git switch missing-branch", &mut wezterm)
-            .expect_err("git switch should fail for a missing branch");
-        assert!(error.to_string().contains("failed to switch"));
-        assert!(app.status_line().contains("failed to switch"));
-        assert_eq!(
-            super::read_branch_name(&root).expect("branch should be readable"),
-            "main"
-        );
+        app.execute_project_command("git switch missing-branch", &mut wezterm)
+            .expect("git switch should queue");
+        assert!(app.status_line().contains("Queued git_switch for alpha"));
 
         app.tick(&mut wezterm)
             .expect("background refresh should succeed");
 
-        assert!(app.status_line().contains("failed to switch"));
+        assert!(app.status_line().contains("Queued git_switch for alpha"));
     }
 
     #[test]
@@ -2893,9 +1887,18 @@ mod tests {
 
         assert!(!app.is_command_active());
         assert_eq!(
-            super::read_branch_name(&root).expect("branch should be readable"),
-            "feature/confirm"
+            app.drain_outbox(),
+            vec![ClientMessage::RunOperation {
+                project_id: root_as_str(&root).to_string(),
+                operation: "git_switch".to_string(),
+                command: "git switch feature/confirm".to_string(),
+            }]
         );
+        assert_eq!(
+            super::read_branch_name(&root).expect("branch should be readable"),
+            "main"
+        );
+        assert!(app.status_line().contains("Queued git_switch for repo"));
     }
 
     #[test]
@@ -3000,13 +2003,15 @@ mod tests {
                 .expect("input should accept text");
         }
 
-        let error = app
-            .apply(AppAction::ConfirmInput, &mut wezterm)
-            .expect_err("root remove should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("remove only works on linked worktrees")
+        app.apply(AppAction::ConfirmInput, &mut wezterm)
+            .expect("root remove should queue");
+        assert_eq!(
+            app.drain_outbox(),
+            vec![ClientMessage::RunOperation {
+                project_id: "/tmp/repos/alpha".to_string(),
+                operation: "wt_remove".to_string(),
+                command: "wt remove".to_string(),
+            }]
         );
     }
 
@@ -3069,114 +2074,49 @@ mod tests {
     }
 
     #[test]
-    fn git_switch_command_changes_selected_root_branch() {
-        let sandbox = test_sandbox("git-switch-root");
-        let root = create_repo_in(&sandbox, "repo");
-        git(&root, &["switch", "-c", "feature/switch-test"]);
-        git(&root, &["switch", "main"]);
-        let projects = super::discover_projects_in(std::slice::from_ref(&sandbox))
-            .expect("projects should be discovered");
-
+    fn git_switch_command_queues_daemon_operation_for_selected_root() {
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
-        let mut app = App::load_with_projects(&mut wezterm, projects).expect("app should load");
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
 
         app.execute_project_command("git switch feature/switch-test", &mut wezterm)
-            .expect("git switch should succeed");
+            .expect("git switch should queue");
 
         assert_eq!(
-            super::read_branch_name(&root).expect("branch should be readable"),
-            "feature/switch-test"
+            app.drain_outbox(),
+            vec![ClientMessage::RunOperation {
+                project_id: "/tmp/repos/alpha".to_string(),
+                operation: "git_switch".to_string(),
+                command: "git switch feature/switch-test".to_string(),
+            }]
         );
-        assert_eq!(
-            app.projects()[app.selected_project_index()].cwd,
-            root_as_str(&root)
-        );
-        assert!(
-            app.status_line()
-                .contains("Switched repo to feature/switch-test")
-        );
+        assert!(app.status_line().contains("Queued git_switch for alpha"));
     }
 
     #[test]
-    fn git_switch_command_creates_local_tracking_branch_from_remote_ref() {
-        let sandbox = test_sandbox("git-switch-remote-ref");
-        let root = create_repo_in(&sandbox, "repo");
-        let remote = sandbox.join("origin.git");
-
-        git(&sandbox, &["init", "--bare", root_as_str(&remote)]);
-        git(&root, &["remote", "add", "origin", root_as_str(&remote)]);
-        git(&root, &["push", "-u", "origin", "main"]);
-        git(&root, &["switch", "-c", "feature/remote-only"]);
-        write_file(&root.join("remote.txt"), "remote\n");
-        git_commit_all(&root, "remote branch");
-        git(&root, &["push", "-u", "origin", "feature/remote-only"]);
-        git(&root, &["switch", "main"]);
-        git(&root, &["branch", "-D", "feature/remote-only"]);
-        git(&root, &["fetch", "origin"]);
-
-        let projects = super::discover_projects_in(std::slice::from_ref(&sandbox))
-            .expect("projects should be discovered");
-
+    fn git_pull_command_queues_daemon_operation_for_selected_root() {
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
-        let mut app = App::load_with_projects(&mut wezterm, projects).expect("app should load");
-
-        app.execute_project_command("git switch origin/feature/remote-only", &mut wezterm)
-            .expect("git switch should create tracking branch");
-
-        assert_eq!(
-            super::read_branch_name(&root).expect("branch should be readable"),
-            "feature/remote-only"
-        );
-        assert!(branch_exists(&root, "feature/remote-only"));
-        assert!(
-            app.status_line()
-                .contains("Switched repo to origin/feature/remote-only")
-        );
-    }
-
-    #[test]
-    fn git_pull_command_refreshes_selected_root_project() {
-        let sandbox = test_sandbox("git-pull-root");
-        let remote = sandbox.join("origin.git");
-        let peer_parent = sandbox.join("peer-parent");
-        fs::create_dir_all(&peer_parent).expect("peer parent should exist");
-
-        git(&sandbox, &["init", "--bare", root_as_str(&remote)]);
-        let root = create_repo_in(&sandbox, "repo");
-        git(&root, &["remote", "add", "origin", root_as_str(&remote)]);
-        git(&root, &["push", "-u", "origin", "main"]);
-
-        let peer = peer_parent.join("peer");
-        git(
-            &peer_parent,
-            &["clone", root_as_str(&remote), root_as_str(&peer)],
-        );
-        write_file(&peer.join("pulled.txt"), "updated\n");
-        git_commit_all(&peer, "peer update");
-        git(&peer, &["push", "origin", "main"]);
-
-        let projects = super::discover_projects_in(std::slice::from_ref(&sandbox))
-            .expect("projects should be discovered");
-
-        set_wezterm_pane();
-        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
-        let mut app = App::load_with_projects(&mut wezterm, projects).expect("app should load");
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
 
         app.execute_project_command("git pull", &mut wezterm)
-            .expect("git pull should succeed");
+            .expect("git pull should queue");
 
-        assert_eq!(head_message(&root), "peer update");
         assert_eq!(
-            app.projects()[app.selected_project_index()].cwd,
-            root_as_str(&root)
+            app.drain_outbox(),
+            vec![ClientMessage::RunOperation {
+                project_id: "/tmp/repos/alpha".to_string(),
+                operation: "git_pull".to_string(),
+                command: "git pull".to_string(),
+            }]
         );
-        assert!(app.status_line().contains("Pulled updates for repo"));
+        assert!(app.status_line().contains("Queued git_pull for alpha"));
     }
 
     #[test]
-    fn git_switch_command_rejects_worktrees() {
+    fn worktree_command_queues_daemon_operation_for_selected_worktree() {
         let fixture = create_worktree_fixture("git-switch-worktree-reject");
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
@@ -3185,42 +2125,43 @@ mod tests {
         app.apply(AppAction::ProjectMoveDown, &mut wezterm)
             .expect("selection should move to worktree");
 
-        let error = app
-            .execute_project_command("git switch main", &mut wezterm)
-            .expect_err("git switch should reject worktrees");
-        assert!(
-            error
-                .to_string()
-                .contains("git switch only works on root projects")
+        app.execute_project_command("wt merge", &mut wezterm)
+            .expect("merge should queue");
+
+        assert_eq!(
+            app.drain_outbox(),
+            vec![ClientMessage::RunOperation {
+                project_id: root_as_str(&fixture.worktree).to_string(),
+                operation: "wt_merge".to_string(),
+                command: "wt merge".to_string(),
+            }]
         );
-        assert!(
-            app.status_line()
-                .contains("git switch only works on root projects")
-        );
+        assert!(app.status_line().contains("Queued wt_merge for feature"));
     }
 
     #[test]
-    fn git_switch_command_reports_failure_when_branch_is_checked_out_in_worktree() {
-        let fixture = create_worktree_fixture("git-switch-checked-out-elsewhere");
+    fn wt_add_command_queues_daemon_operation() {
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
-        let mut app = App::load_with_projects(&mut wezterm, fixture.projects.clone())
-            .expect("app should load");
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
 
-        let error = app
-            .execute_project_command("git switch feature", &mut wezterm)
-            .expect_err("git switch should fail while branch is checked out in worktree");
+        app.execute_project_command("wt add feature/BOOST-3432", &mut wezterm)
+            .expect("worktree creation should queue");
 
-        assert!(error.to_string().contains("failed to switch"));
-        assert!(app.status_line().contains("failed to switch"));
         assert_eq!(
-            super::read_branch_name(&fixture.root).expect("branch should be readable"),
-            "main"
+            app.drain_outbox(),
+            vec![ClientMessage::RunOperation {
+                project_id: "/tmp/repos/alpha".to_string(),
+                operation: "wt_add".to_string(),
+                command: "wt add feature/BOOST-3432".to_string(),
+            }]
         );
+        assert!(app.status_line().contains("Queued wt_add for alpha"));
     }
 
     #[test]
-    fn merge_command_fast_forwards_main_and_keeps_worktree_selected() {
+    fn worktree_remove_and_land_commands_queue_daemon_operations() {
         let fixture = create_worktree_fixture("merge-command");
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
@@ -3229,46 +2170,26 @@ mod tests {
         app.apply(AppAction::ProjectMoveDown, &mut wezterm)
             .expect("selection should move to worktree");
 
-        app.execute_project_command("wt merge", &mut wezterm)
-            .expect("merge should succeed");
-
-        assert_eq!(head_message(&fixture.root), "feature change");
+        app.execute_project_command("wt remove", &mut wezterm)
+            .expect("remove should queue");
         assert_eq!(
-            app.projects()[app.selected_project_index()].cwd,
-            root_as_str(&fixture.worktree)
+            app.drain_outbox(),
+            vec![ClientMessage::RunOperation {
+                project_id: root_as_str(&fixture.worktree).to_string(),
+                operation: "wt_remove".to_string(),
+                command: "wt remove".to_string(),
+            }]
         );
-        assert!(app.status_line().contains("Merged feature into main"));
-    }
 
-    #[test]
-    fn wt_add_preserves_branch_names_with_slashes_and_generates_wt_directory() {
-        let sandbox = test_sandbox("create-worktree-raw-branch");
-        let root = sandbox.join("repo");
-
-        git(
-            &sandbox,
-            &["init", "--initial-branch=main", root_as_str(&root)],
-        );
-        write_file(&root.join("tracked.txt"), "hello\n");
-        git_commit_all(&root, "init");
-
-        let projects = super::discover_projects_in(std::slice::from_ref(&sandbox))
-            .expect("projects should be discovered");
-
-        set_wezterm_pane();
-        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
-        let mut app = App::load_with_projects(&mut wezterm, projects).expect("app should load");
-
-        app.execute_project_command("wt add feature/BOOST-3432", &mut wezterm)
-            .expect("worktree creation should succeed");
-
-        let created = &app.projects()[app.selected_project_index()];
-        assert_eq!(created.branch, "feature/BOOST-3432");
-        assert_eq!(created.name, "feature/BOOST-3432");
-        assert!(
-            created
-                .cwd
-                .starts_with(&format!("{}/wt-", sandbox.display()))
+        app.execute_project_command("wt land", &mut wezterm)
+            .expect("land should queue");
+        assert_eq!(
+            app.drain_outbox(),
+            vec![ClientMessage::RunOperation {
+                project_id: root_as_str(&fixture.worktree).to_string(),
+                operation: "wt_land".to_string(),
+                command: "wt land".to_string(),
+            }]
         );
     }
 
@@ -3308,11 +2229,9 @@ mod tests {
 
         let error = super::load_repo_sources_from_config_at(&config_path, &home)
             .expect_err("missing repo source should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("configured repo source does not exist")
-        );
+        assert!(error
+            .to_string()
+            .contains("configured repo source does not exist"));
     }
 
     #[test]
@@ -3335,105 +2254,8 @@ mod tests {
     }
 
     #[test]
-    fn worktree_creation_uses_selected_project_parent_directory() {
-        let left = test_sandbox("worktree-parent-left");
-        let right = test_sandbox("worktree-parent-right");
-        let left_repo = create_repo_in(&left, "alpha");
-        let right_repo = create_repo_in(&right, "zeta");
-        let projects = super::discover_projects_in(&[left.clone(), right.clone()])
-            .expect("projects should be discovered");
-
-        set_wezterm_pane();
-        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
-        let mut app = App::load_with_projects(&mut wezterm, projects).expect("app should load");
-
-        app.apply(AppAction::ProjectMoveDown, &mut wezterm)
-            .expect("selection should move to the second project");
-        app.execute_project_command("wt add feature", &mut wezterm)
-            .expect("worktree creation should succeed");
-
-        let created = &app.projects()[app.selected_project_index()];
-        assert_eq!(created.root_cwd, root_as_str(&right_repo));
-        assert!(created.cwd.starts_with(&format!("{}/wt-", right.display())));
-        assert!(!created.cwd.starts_with(&format!("{}/wt-", left.display())));
-        assert_eq!(app.projects()[0].root_cwd, root_as_str(&left_repo));
-    }
-
-    #[test]
-    fn remove_command_refreshes_tui_state() {
-        let fixture = create_worktree_fixture("remove-command-refresh");
-        git(&fixture.root, &["merge", "--ff-only", "feature"]);
-        set_wezterm_pane();
-        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
-        let mut app = App::load_with_projects(&mut wezterm, fixture.projects.clone())
-            .expect("app should load");
-        app.apply(AppAction::ProjectMoveDown, &mut wezterm)
-            .expect("selection should move to worktree");
-
-        app.execute_project_command("wt remove", &mut wezterm)
-            .expect("remove should succeed");
-
-        assert!(!fixture.worktree.exists());
-        assert!(!branch_exists(&fixture.root, "feature"));
-        assert_eq!(app.projects().len(), 1);
-        assert_eq!(app.projects()[0].cwd, root_as_str(&fixture.root));
-        assert_eq!(app.selected_project_index(), 0);
-        assert!(app.status_line().contains("Removed worktree"));
-        assert_eq!(wezterm.calls, vec![Call::ListPanes, Call::ListPanes]);
-    }
-
-    #[test]
-    fn land_command_merges_and_removes_worktree() {
-        let fixture = create_worktree_fixture("land-command");
-        set_wezterm_pane();
-        let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
-        let mut app = App::load_with_projects(&mut wezterm, fixture.projects.clone())
-            .expect("app should load");
-        app.apply(AppAction::ProjectMoveDown, &mut wezterm)
-            .expect("selection should move to worktree");
-
-        app.execute_project_command("wt land", &mut wezterm)
-            .expect("land should succeed");
-
-        assert_eq!(head_message(&fixture.root), "feature change");
-        assert!(!fixture.worktree.exists());
-        assert!(!branch_exists(&fixture.root, "feature"));
-        assert!(app.status_line().contains("Removed worktree"));
-    }
-
-    #[test]
-    fn pr_command_pushes_branch_and_creates_pull_request() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+    fn pr_command_queues_daemon_operation() {
         let fixture = create_worktree_fixture("pr-command");
-        git(
-            &fixture.root,
-            &["remote", "add", "origin", root_as_str(&fixture.remote)],
-        );
-        git(&fixture.root, &["push", "-u", "origin", "main"]);
-
-        let fake_bin = test_sandbox("fake-gh-bin");
-        let gh_path = fake_bin.join("gh");
-        write_file(
-            &gh_path,
-            "#!/bin/sh
-if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then
-  exit 1
-fi
-if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"create\" ]; then
-  printf '%s\n' 'https://example.com/pr/123'
-  exit 0
-fi
-printf '%s\n' \"unexpected gh invocation: $*\" >&2
-exit 1
-",
-        );
-        chmod_executable(&gh_path);
-        let original_path = env::var("PATH").unwrap_or_default();
-        let patched_path = format!("{}:{}", fake_bin.display(), original_path);
-        unsafe {
-            env::set_var("PATH", patched_path);
-        }
-
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![pane(10, 1, 1), pane(20, 2, 1)]]);
         let mut app = App::load_with_projects(&mut wezterm, fixture.projects.clone())
@@ -3441,18 +2263,18 @@ exit 1
         app.apply(AppAction::ProjectMoveDown, &mut wezterm)
             .expect("selection should move to worktree");
 
-        let result = app.execute_project_command("wt pr", &mut wezterm);
+        app.execute_project_command("wt pr", &mut wezterm)
+            .expect("pr should queue");
 
-        unsafe {
-            env::set_var("PATH", original_path);
-        }
-        result.expect("pr should succeed");
-
-        assert!(remote_branch_exists(&fixture.remote, "feature"));
-        assert!(
-            app.status_line()
-                .contains("PR ready for feature -> main: https://example.com/pr/123")
+        assert_eq!(
+            app.drain_outbox(),
+            vec![ClientMessage::RunOperation {
+                project_id: root_as_str(&fixture.worktree).to_string(),
+                operation: "wt_pr".to_string(),
+                command: "wt pr".to_string(),
+            }]
         );
+        assert!(app.status_line().contains("Queued wt_pr for feature"));
     }
 
     #[test]
@@ -3465,11 +2287,142 @@ exit 1
         app.apply(AppAction::AttachProjectAgent, &mut wezterm)
             .expect("attach should not error");
 
-        assert!(
-            app.status_line()
-                .contains("Start an agent for this project first")
-        );
+        assert!(app
+            .status_line()
+            .contains("Start an agent for this project first"));
         assert_eq!(wezterm.calls, vec![Call::ListPanes]);
+    }
+
+    #[test]
+    fn replacing_workspace_keeps_selection_by_project_id() {
+        use crate::workspace::{ProjectSnapshot, WorkspaceSnapshot};
+        use std::collections::BTreeMap;
+
+        let mut first_projects = BTreeMap::new();
+        first_projects.insert(
+            "root:alpha".to_string(),
+            ProjectSnapshot {
+                id: "root:alpha".to_string(),
+                name: "alpha".to_string(),
+                ..ProjectSnapshot::default()
+            },
+        );
+        first_projects.insert(
+            "root:beta".to_string(),
+            ProjectSnapshot {
+                id: "root:beta".to_string(),
+                name: "beta".to_string(),
+                ..ProjectSnapshot::default()
+            },
+        );
+
+        let mut app = App::from_snapshot(WorkspaceSnapshot {
+            protocol_version: 1,
+            generated_at_ms: 1,
+            projects: first_projects,
+            project_order: vec!["root:alpha".to_string(), "root:beta".to_string()],
+            warnings: Vec::new(),
+        });
+        app.project_move_down();
+
+        let mut second_projects = BTreeMap::new();
+        second_projects.insert(
+            "root:beta".to_string(),
+            ProjectSnapshot {
+                id: "root:beta".to_string(),
+                name: "beta".to_string(),
+                ..ProjectSnapshot::default()
+            },
+        );
+        second_projects.insert(
+            "root:alpha".to_string(),
+            ProjectSnapshot {
+                id: "root:alpha".to_string(),
+                name: "alpha".to_string(),
+                ..ProjectSnapshot::default()
+            },
+        );
+
+        app.replace_workspace(WorkspaceSnapshot {
+            protocol_version: 1,
+            generated_at_ms: 2,
+            projects: second_projects,
+            project_order: vec!["root:beta".to_string(), "root:alpha".to_string()],
+            warnings: Vec::new(),
+        });
+
+        assert_eq!(app.selected_project_id(), Some("root:beta"));
+    }
+
+    #[test]
+    fn replacing_workspace_prefers_agent_that_needs_input() {
+        use crate::workspace::{AgentSnapshot, ProjectSnapshot, WorkspaceSnapshot};
+        use std::collections::BTreeMap;
+
+        let mut first_projects = BTreeMap::new();
+        first_projects.insert(
+            "root:alpha".to_string(),
+            ProjectSnapshot {
+                id: "root:alpha".to_string(),
+                name: "alpha".to_string(),
+                agents: vec![
+                    AgentSnapshot {
+                        runtime: "claude".to_string(),
+                        pane_id: Some(10),
+                        status: "working".to_string(),
+                    },
+                    AgentSnapshot {
+                        runtime: "opencode".to_string(),
+                        pane_id: Some(11),
+                        status: "working".to_string(),
+                    },
+                ],
+                ..ProjectSnapshot::default()
+            },
+        );
+
+        let mut app = App::from_snapshot(WorkspaceSnapshot {
+            protocol_version: 1,
+            generated_at_ms: 1,
+            projects: first_projects,
+            project_order: vec!["root:alpha".to_string()],
+            warnings: Vec::new(),
+        });
+
+        assert_eq!(app.best_attachable_agent(), Some((0, 0)));
+
+        let mut second_projects = BTreeMap::new();
+        second_projects.insert(
+            "root:alpha".to_string(),
+            ProjectSnapshot {
+                id: "root:alpha".to_string(),
+                name: "alpha".to_string(),
+                agents: vec![
+                    AgentSnapshot {
+                        runtime: "claude".to_string(),
+                        pane_id: Some(10),
+                        status: "working".to_string(),
+                    },
+                    AgentSnapshot {
+                        runtime: "opencode".to_string(),
+                        pane_id: Some(11),
+                        status: "needs_input".to_string(),
+                    },
+                ],
+                ..ProjectSnapshot::default()
+            },
+        );
+
+        app.replace_workspace(WorkspaceSnapshot {
+            protocol_version: 1,
+            generated_at_ms: 2,
+            projects: second_projects,
+            project_order: vec!["root:alpha".to_string()],
+            warnings: Vec::new(),
+        });
+
+        let (project_index, agent_index) = app.best_attachable_agent().unwrap();
+        assert_eq!((project_index, agent_index), (0, 1));
     }
 
     #[test]
@@ -3496,65 +2449,36 @@ exit 1
 
     #[test]
     fn follow_mode_attaches_global_needs_input_agent() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
-        let state_dir = test_sandbox("follow-mode-global-attach");
-        write_file(
-            &state_dir.join("20"),
-            r#"{"source":"claude","effective_state":"working"}"#,
-        );
-        write_file(
-            &state_dir.join("30"),
-            r#"{"runtime":"opencode","effective_state":"needs_input"}"#,
-        );
-        unsafe {
-            env::set_var("NERVE_CENTER_DATA_DIR", root_as_str(&state_dir));
-        }
-
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![
             pane_with_cwd(10, 1, 1, "file:///tmp/repos/nerve_center"),
             pane_with_cwd(20, 2, 1, "file:///tmp/repos/alpha"),
             pane_with_cwd(30, 3, 1, "file:///tmp/repos/beta"),
         ]]);
-        let mut app =
-            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+        let mut app = load_test_app_with_agents(
+            &mut wezterm,
+            vec![
+                ("alpha", vec![("claude", 20, "working")]),
+                ("beta", vec![("opencode", 30, "needs_input")]),
+            ],
+        );
 
         let result = app.apply(AppAction::ToggleFollowMode, &mut wezterm);
-
-        unsafe {
-            env::remove_var("NERVE_CENTER_DATA_DIR");
-        }
         result.expect("follow mode should attach the global needs-input agent");
 
         assert!(app.is_follow_mode());
         assert_eq!(app.attached_pane_id, Some(30));
         assert_eq!(app.follow_queue_len(), 1);
-        assert!(
-            app.input_line()
-                .contains("Follow mode: forwarding to oc:30[i] for beta")
-        );
-        assert!(
-            app.status_line()
-                .contains("Follow attached oc:30[i] for beta")
-        );
+        assert!(app
+            .input_line()
+            .contains("Follow mode: forwarding to oc:30[i] for beta"));
+        assert!(app
+            .status_line()
+            .contains("Follow attached oc:30[i] for beta"));
     }
 
     #[test]
     fn follow_mode_advances_to_next_waiting_agent_after_input() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
-        let state_dir = test_sandbox("follow-mode-advances");
-        write_file(
-            &state_dir.join("20"),
-            r#"{"source":"claude","effective_state":"needs_input"}"#,
-        );
-        write_file(
-            &state_dir.join("30"),
-            r#"{"runtime":"opencode","effective_state":"needs_input"}"#,
-        );
-        unsafe {
-            env::set_var("NERVE_CENTER_DATA_DIR", root_as_str(&state_dir));
-        }
-
         set_wezterm_pane();
         let snapshot = vec![
             pane_with_cwd(10, 1, 1, "file:///tmp/repos/nerve_center"),
@@ -3562,8 +2486,13 @@ exit 1
             pane_with_cwd(30, 3, 1, "file:///tmp/repos/beta"),
         ];
         let mut wezterm = FakeWezterm::new(vec![snapshot.clone(), snapshot.clone(), snapshot]);
-        let mut app =
-            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+        let mut app = load_test_app_with_agents(
+            &mut wezterm,
+            vec![
+                ("alpha", vec![("claude", 20, "needs_input")]),
+                ("beta", vec![("opencode", 30, "needs_input")]),
+            ],
+        );
 
         let result = (|| -> Result<()> {
             app.apply(AppAction::ToggleFollowMode, &mut wezterm)?;
@@ -3571,56 +2500,39 @@ exit 1
             assert_eq!(app.follow_queue_len(), 2);
 
             app.apply(AppAction::Forward("answer".to_string()), &mut wezterm)?;
-            write_file(
-                &state_dir.join("20"),
-                r#"{"source":"claude","effective_state":"working"}"#,
-            );
+            app.replace_workspace(test_snapshot_with_agents(vec![
+                ("alpha", vec![("claude", 20, "working")]),
+                ("beta", vec![("opencode", 30, "needs_input")]),
+            ]));
             app.tick(&mut wezterm)?;
 
             assert_eq!(app.attached_pane_id, Some(30));
             assert_eq!(app.follow_queue_len(), 1);
-            assert!(
-                app.status_line()
-                    .contains("Follow attached oc:30[i] for beta")
-            );
+            assert!(app
+                .status_line()
+                .contains("Follow attached oc:30[i] for beta"));
 
             app.apply(AppAction::ExitForwarding, &mut wezterm)?;
             assert!(app.is_follow_mode());
             assert!(!app.is_forwarding());
             Ok(())
         })();
-
-        unsafe {
-            env::remove_var("NERVE_CENTER_DATA_DIR");
-        }
         result.expect("follow mode should advance to the next waiting agent");
     }
 
     #[test]
     fn attach_project_agent_and_refocuses_tui() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
-        let state_dir = test_sandbox("attach-project-agent");
-        write_file(
-            &state_dir.join("20"),
-            r#"{"source":"claude","effective_state":"working"}"#,
-        );
-        unsafe {
-            env::set_var("NERVE_CENTER_DATA_DIR", root_as_str(&state_dir));
-        }
-
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![
             pane_with_cwd(10, 1, 1, "file:///tmp/repos/nerve_center"),
             pane_with_cwd(20, 2, 1, "file:///tmp/repos/alpha"),
         ]]);
-        let mut app =
-            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+        let mut app = load_test_app_with_agents(
+            &mut wezterm,
+            vec![("alpha", vec![("claude", 20, "working")])],
+        );
 
         let result = app.apply(AppAction::AttachProjectAgent, &mut wezterm);
-
-        unsafe {
-            env::remove_var("NERVE_CENTER_DATA_DIR");
-        }
         result.expect("attach should succeed");
 
         assert_eq!(app.attached_pane_id, Some(20));
@@ -3642,34 +2554,21 @@ exit 1
 
     #[test]
     fn attach_project_agent_prefers_agent_that_needs_input() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
-        let state_dir = test_sandbox("attach-project-agent-prefers-needs-input");
-        write_file(
-            &state_dir.join("20"),
-            r#"{"source":"claude","effective_state":"working"}"#,
-        );
-        write_file(
-            &state_dir.join("30"),
-            r#"{"runtime":"opencode","effective_state":"needs_input"}"#,
-        );
-        unsafe {
-            env::set_var("NERVE_CENTER_DATA_DIR", root_as_str(&state_dir));
-        }
-
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![
             pane_with_cwd(10, 1, 1, "file:///tmp/repos/nerve_center"),
             pane_with_cwd(20, 2, 1, "file:///tmp/repos/alpha"),
             pane_with_cwd(30, 3, 1, "file:///tmp/repos/alpha"),
         ]]);
-        let mut app =
-            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+        let mut app = load_test_app_with_agents(
+            &mut wezterm,
+            vec![(
+                "alpha",
+                vec![("claude", 20, "working"), ("opencode", 30, "needs_input")],
+            )],
+        );
 
         let result = app.apply(AppAction::AttachProjectAgent, &mut wezterm);
-
-        unsafe {
-            env::remove_var("NERVE_CENTER_DATA_DIR");
-        }
         result.expect("attach should succeed");
 
         assert_eq!(app.attached_pane_id, Some(30));
@@ -3692,35 +2591,22 @@ exit 1
 
     #[test]
     fn attach_project_agent_starts_forwarding_and_escape_stops_it() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
-        let state_dir = test_sandbox("attach-project-agent-forwarding");
-        write_file(
-            &state_dir.join("20"),
-            r#"{"source":"claude","effective_state":"working"}"#,
-        );
-        unsafe {
-            env::set_var("NERVE_CENTER_DATA_DIR", root_as_str(&state_dir));
-        }
-
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![
             pane_with_cwd(10, 1, 1, "file:///tmp/repos/nerve_center"),
             pane_with_cwd(20, 2, 1, "file:///tmp/repos/alpha"),
         ]]);
-        let mut app =
-            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+        let mut app = load_test_app_with_agents(
+            &mut wezterm,
+            vec![("alpha", vec![("claude", 20, "working")])],
+        );
 
         let result = app.apply(AppAction::AttachProjectAgent, &mut wezterm);
-
-        unsafe {
-            env::remove_var("NERVE_CENTER_DATA_DIR");
-        }
         result.expect("attach should succeed");
         assert_eq!(app.mode, Mode::Forwarding);
-        assert!(
-            app.input_line()
-                .contains("Forwarding keys to cc:20[w] for alpha")
-        );
+        assert!(app
+            .input_line()
+            .contains("Forwarding keys to cc:20[w] for alpha"));
 
         app.apply(AppAction::Forward("i".to_string()), &mut wezterm)
             .expect("forward should succeed");
@@ -3750,24 +2636,6 @@ exit 1
 
     #[test]
     fn forwarding_mode_switches_between_project_agents_without_wrapping() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
-        let state_dir = test_sandbox("attach-project-agent-switches");
-        write_file(
-            &state_dir.join("20"),
-            r#"{"source":"claude","effective_state":"working"}"#,
-        );
-        write_file(
-            &state_dir.join("30"),
-            r#"{"runtime":"opencode","effective_state":"needs_input"}"#,
-        );
-        write_file(
-            &state_dir.join("40"),
-            r#"{"runtime":"opencode","effective_state":"done"}"#,
-        );
-        unsafe {
-            env::set_var("NERVE_CENTER_DATA_DIR", root_as_str(&state_dir));
-        }
-
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![
             pane_with_cwd(10, 1, 1, "file:///tmp/repos/nerve_center"),
@@ -3775,8 +2643,17 @@ exit 1
             pane_with_cwd(30, 3, 1, "file:///tmp/repos/alpha"),
             pane_with_cwd(40, 4, 1, "file:///tmp/repos/alpha"),
         ]]);
-        let mut app =
-            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+        let mut app = load_test_app_with_agents(
+            &mut wezterm,
+            vec![(
+                "alpha",
+                vec![
+                    ("claude", 20, "working"),
+                    ("opencode", 30, "needs_input"),
+                    ("opencode", 40, "done"),
+                ],
+            )],
+        );
 
         let result = (|| -> Result<()> {
             app.apply(AppAction::AttachProjectAgent, &mut wezterm)?;
@@ -3805,25 +2682,11 @@ exit 1
 
             Ok(())
         })();
-
-        unsafe {
-            env::remove_var("NERVE_CENTER_DATA_DIR");
-        }
         result.expect("agent switching should succeed");
     }
 
     #[test]
     fn unsupported_layout_does_not_run_project_attach_commands() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
-        let state_dir = test_sandbox("attach-project-agent-unsupported");
-        write_file(
-            &state_dir.join("40"),
-            r#"{"source":"claude","effective_state":"working"}"#,
-        );
-        unsafe {
-            env::set_var("NERVE_CENTER_DATA_DIR", root_as_str(&state_dir));
-        }
-
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![
             pane(10, 1, 1),
@@ -3831,14 +2694,12 @@ exit 1
             pane(30, 1, 1),
             pane_with_cwd(40, 2, 1, "file:///tmp/repos/alpha"),
         ]]);
-        let mut app =
-            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+        let mut app = load_test_app_with_agents(
+            &mut wezterm,
+            vec![("alpha", vec![("claude", 40, "working")])],
+        );
 
         let result = app.apply(AppAction::AttachProjectAgent, &mut wezterm);
-
-        unsafe {
-            env::remove_var("NERVE_CENTER_DATA_DIR");
-        }
         result.expect("unsupported layout should not error");
 
         assert!(app.status_line().contains("unsupported layout"));
@@ -4012,21 +2873,6 @@ exit 0
 
     #[test]
     fn loads_multiple_agent_monitors_for_one_project() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
-        let state_dir = test_sandbox("agent-state-dir");
-        write_file(
-            &state_dir.join("20"),
-            r#"{"source":"claude","effective_state":"working"}"#,
-        );
-        write_file(
-            &state_dir.join("30"),
-            r#"{"runtime":"opencode","effective_state":"needs_input"}"#,
-        );
-
-        unsafe {
-            env::set_var("NERVE_CENTER_DATA_DIR", root_as_str(&state_dir));
-        }
-
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![
             pane_with_cwd(10, 1, 1, "file:///tmp/repos/nerve_center"),
@@ -4034,11 +2880,13 @@ exit 0
             pane_with_cwd(30, 3, 1, "file:///tmp/repos/alpha"),
         ]]);
 
-        let app = App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
-
-        unsafe {
-            env::remove_var("NERVE_CENTER_DATA_DIR");
-        }
+        let app = load_test_app_with_agents(
+            &mut wezterm,
+            vec![(
+                "alpha",
+                vec![("claude", 20, "working"), ("opencode", 30, "needs_input")],
+            )],
+        );
 
         let alpha_monitors = app
             .project_agent_monitors(0)
@@ -4051,13 +2899,6 @@ exit 0
 
     #[test]
     fn hook_state_replaces_provisional_agent_monitor() {
-        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
-        let state_dir = test_sandbox("agent-state-replaces-provisional");
-
-        unsafe {
-            env::set_var("NERVE_CENTER_DATA_DIR", root_as_str(&state_dir));
-        }
-
         set_wezterm_pane();
         let mut wezterm = FakeWezterm::new(vec![vec![
             pane_with_cwd(10, 1, 1, "file:///tmp/repos/nerve_center"),
@@ -4076,15 +2917,11 @@ exit 0
             vec!["cc:21[s]"]
         );
 
-        write_file(
-            &state_dir.join("21"),
-            r#"{"source":"claude","effective_state":"working"}"#,
-        );
+        app.replace_workspace(test_snapshot_with_agents(vec![(
+            "alpha",
+            vec![("claude", 21, "working")],
+        )]));
         app.refresh(&mut wezterm).expect("refresh should succeed");
-
-        unsafe {
-            env::remove_var("NERVE_CENTER_DATA_DIR");
-        }
 
         assert_eq!(
             app.project_agent_monitors(0)
@@ -4093,6 +2930,37 @@ exit 0
                 .collect::<Vec<_>>(),
             vec!["cc:21[w]"]
         );
+    }
+
+    #[test]
+    fn refresh_ignores_local_pane_state_files_without_snapshot_agents() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let state_dir = test_sandbox("refresh-ignores-local-pane-state");
+        write_file(
+            &state_dir.join("20"),
+            r#"{"source":"claude","effective_state":"working"}"#,
+        );
+
+        unsafe {
+            env::set_var("NERVE_CENTER_DATA_DIR", root_as_str(&state_dir));
+        }
+
+        set_wezterm_pane();
+        let mut wezterm = FakeWezterm::new(vec![vec![
+            pane_with_cwd(10, 1, 1, "file:///tmp/repos/nerve_center"),
+            pane_with_cwd(20, 2, 1, "file:///tmp/repos/alpha"),
+        ]]);
+        let mut app =
+            App::load_with_projects(&mut wezterm, test_projects()).expect("app should load");
+
+        let result = app.refresh(&mut wezterm);
+
+        unsafe {
+            env::remove_var("NERVE_CENTER_DATA_DIR");
+        }
+
+        result.expect("refresh should succeed");
+        assert!(app.project_agent_monitors(0).is_empty());
     }
 
     #[test]
@@ -4198,6 +3066,88 @@ u UU N... 100644 100644 100644 100644 abcdef1 abcdef2 abcdef3 conflict.txt\n\
     }
 
     #[test]
+    fn project_entries_from_snapshot_uses_structured_status_summary() {
+        let snapshot = crate::workspace::WorkspaceSnapshot {
+            protocol_version: 1,
+            generated_at_ms: 1,
+            project_order: vec!["/tmp/repos/alpha".to_string()],
+            projects: std::collections::BTreeMap::from([(
+                "/tmp/repos/alpha".to_string(),
+                crate::workspace::ProjectSnapshot {
+                    id: "/tmp/repos/alpha".to_string(),
+                    name: "alpha".to_string(),
+                    cwd: "/tmp/repos/alpha".to_string(),
+                    root_id: "/tmp/repos/alpha".to_string(),
+                    kind: ProjectKind::Root,
+                    git: crate::workspace::ProjectGitState {
+                        branch: "main".to_string(),
+                        status: "clean ^1".to_string(),
+                        status_summary: ProjectStatusSummary {
+                            ahead: 1,
+                            ..ProjectStatusSummary::default()
+                        },
+                    },
+                    ..crate::workspace::ProjectSnapshot::default()
+                },
+            )]),
+            warnings: Vec::new(),
+        };
+
+        let projects = super::project_entries_from_snapshot(&snapshot);
+
+        assert_eq!(projects[0].status_summary.ahead, 1);
+    }
+
+    #[test]
+    fn status_line_surfaces_latest_workspace_warning() {
+        let snapshot = crate::workspace::WorkspaceSnapshot {
+            protocol_version: 1,
+            generated_at_ms: 1,
+            project_order: Vec::new(),
+            projects: std::collections::BTreeMap::new(),
+            warnings: vec!["operation git_pull failed for /tmp/repos/alpha".to_string()],
+        };
+
+        let app = App::from_snapshot(snapshot);
+
+        assert!(app
+            .status_line()
+            .contains("WARN: operation git_pull failed for /tmp/repos/alpha"));
+    }
+
+    #[test]
+    fn project_operation_text_formats_operation_state() {
+        let snapshot = crate::workspace::WorkspaceSnapshot {
+            protocol_version: 1,
+            generated_at_ms: 1,
+            project_order: vec!["/tmp/repos/alpha".to_string()],
+            projects: std::collections::BTreeMap::from([(
+                "/tmp/repos/alpha".to_string(),
+                crate::workspace::ProjectSnapshot {
+                    id: "/tmp/repos/alpha".to_string(),
+                    name: "alpha".to_string(),
+                    cwd: "/tmp/repos/alpha".to_string(),
+                    root_id: "/tmp/repos/alpha".to_string(),
+                    kind: ProjectKind::Root,
+                    operation: crate::workspace::ProjectOperationState {
+                        kind: "git_pull".to_string(),
+                        message: "running".to_string(),
+                    },
+                    ..crate::workspace::ProjectSnapshot::default()
+                },
+            )]),
+            warnings: Vec::new(),
+        };
+
+        let app = App::from_snapshot(snapshot);
+
+        assert_eq!(
+            app.project_operation_text(0).as_deref(),
+            Some("op:git_pull[running]")
+        );
+    }
+
+    #[test]
     fn trims_worktree_branch_input_without_renaming_it() {
         assert_eq!(
             super::normalize_worktree_branch_input(" feature/BOOST-3432 "),
@@ -4248,11 +3198,9 @@ u UU N... 100644 100644 100644 100644 abcdef1 abcdef2 abcdef3 conflict.txt\n\
 
         let remove_error = run_git_worktree_remove(root_as_str(&root), root_as_str(&worktree))
             .expect_err("dirty worktree removal should fail");
-        assert!(
-            remove_error
-                .to_string()
-                .contains("git worktree remove failed")
-        );
+        assert!(remove_error
+            .to_string()
+            .contains("git worktree remove failed"));
 
         run_git_branch_delete(root_as_str(&root), "review")
             .expect_err("branch should still be checked out in dirty worktree");
@@ -4260,9 +3208,7 @@ u UU N... 100644 100644 100644 100644 abcdef1 abcdef2 abcdef3 conflict.txt\n\
 
     #[derive(Debug)]
     struct WorktreeFixture {
-        root: PathBuf,
         worktree: PathBuf,
-        remote: PathBuf,
         projects: Vec<ProjectEntry>,
     }
 
@@ -4288,12 +3234,7 @@ u UU N... 100644 100644 100644 100644 abcdef1 abcdef2 abcdef3 conflict.txt\n\
 
         let projects = super::discover_projects_in(std::slice::from_ref(&sandbox))
             .expect("projects should be discovered");
-        WorktreeFixture {
-            root,
-            worktree,
-            remote,
-            projects,
-        }
+        WorktreeFixture { worktree, projects }
     }
 
     fn create_repo_in(parent: &Path, name: &str) -> PathBuf {
@@ -4357,47 +3298,6 @@ u UU N... 100644 100644 100644 100644 abcdef1 abcdef2 abcdef3 conflict.txt\n\
                 message,
             ],
         );
-    }
-
-    fn head_message(workdir: &Path) -> String {
-        let output = Command::new("git")
-            .args(["log", "-1", "--pretty=%s"])
-            .current_dir(workdir)
-            .output()
-            .expect("git log should start");
-        assert!(output.status.success(), "git log should succeed");
-        String::from_utf8(output.stdout)
-            .expect("git log output should be utf-8")
-            .trim()
-            .to_string()
-    }
-
-    fn branch_exists(workdir: &Path, branch: &str) -> bool {
-        Command::new("git")
-            .args([
-                "show-ref",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}"),
-            ])
-            .current_dir(workdir)
-            .status()
-            .expect("git show-ref should start")
-            .success()
-    }
-
-    fn remote_branch_exists(remote_repo: &Path, branch: &str) -> bool {
-        Command::new("git")
-            .args([
-                "show-ref",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}"),
-            ])
-            .current_dir(remote_repo)
-            .status()
-            .expect("git show-ref should start")
-            .success()
     }
 
     fn chmod_executable(path: &Path) {

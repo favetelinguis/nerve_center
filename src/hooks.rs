@@ -8,11 +8,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::cli::InternalCommands;
+use crate::daemon::agent::AgentEvent;
+use crate::projects::{discover_projects_in, load_repo_sources_from_config, ProjectEntry};
 
 const CLAUDE_COMMAND_NAME: &str = "internal ingest-claude-hook";
 const OPENCODE_SUBCOMMAND_NAME: &str = "ingest-opencode-event";
@@ -422,51 +424,32 @@ fn ingest_claude_hook() -> Result<()> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("Claude hook payload missing hook_event_name"))?;
 
-    update_pane_state(pane_id, "claude", |state| {
-        match event_name {
-            "UserPromptSubmit" | "PreToolUse" => {
-                state.main_state = "working".to_string();
-                state.awaiting_user = None;
-                state.error = None;
-            }
-            "Stop" => {
-                state.main_state = "done".to_string();
-                state.subagent_count = 0;
-                state.awaiting_user = None;
-                state.error = None;
-            }
-            "StopFailure" => {
-                state.main_state = "error".to_string();
-                state.subagent_count = 0;
-                state.awaiting_user = None;
-                state.error = payload
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .or_else(|| Some("claude stop failure".to_string()));
-            }
-            "SubagentStart" => {
-                state.subagent_count = state.subagent_count.saturating_add(1);
-                state.awaiting_user = None;
-            }
-            "SubagentStop" => {
-                state.subagent_count = state.subagent_count.saturating_sub(1);
-            }
-            "Notification" => {
-                let notification_type = payload
-                    .get("notification_type")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if matches!(
-                    notification_type,
-                    "permission_prompt" | "elicitation_dialog"
-                ) {
-                    state.awaiting_user = Some(notification_type.to_string());
-                }
-            }
-            _ => {}
+    let (state, awaiting_user) = match event_name {
+        "UserPromptSubmit" | "PreToolUse" | "SubagentStart" | "SubagentStop" => ("working", None),
+        "Stop" => ("done", None),
+        "StopFailure" => ("error", None),
+        "Notification" => {
+            let notification_type = payload
+                .get("notification_type")
+                .and_then(Value::as_str)
+                .filter(|kind| matches!(*kind, "permission_prompt" | "elicitation_dialog"))
+                .map(str::to_string);
+            let state = if notification_type.is_some() {
+                "working"
+            } else {
+                return Ok(());
+            };
+            (state, notification_type)
         }
-        state.touch(event_name);
+        _ => return Ok(()),
+    };
+
+    dispatch_agent_event(AgentEvent {
+        project_id: project_id_from_current_dir()?,
+        runtime: "claude".to_string(),
+        pane_id,
+        state: state.to_string(),
+        awaiting_user,
     })
 }
 
@@ -481,11 +464,23 @@ fn ingest_opencode_event() -> Result<()> {
         .get("event_type")
         .and_then(Value::as_str)
         .unwrap_or("opencode");
-    let awaiting_user = payload.get("awaiting_user").and_then(Value::as_str);
+    let awaiting_user = payload
+        .get("awaiting_user")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
-    update_pane_state(pane_id, "opencode", |state| {
-        apply_opencode_state_update(state, state_name, event_type, awaiting_user);
-    })
+    let mut event = AgentEvent {
+        project_id: project_id_from_current_dir()?,
+        runtime: "opencode".to_string(),
+        pane_id,
+        state: state_name.to_string(),
+        awaiting_user,
+    };
+    if event.state == "working" && !clears_opencode_input_wait(event_type) {
+        event.awaiting_user = event.awaiting_user.or_else(|| Some("question".to_string()));
+    }
+
+    dispatch_agent_event(event)
 }
 
 fn ingest_pi_event() -> Result<()> {
@@ -499,12 +494,56 @@ fn ingest_pi_event() -> Result<()> {
         .get("event_type")
         .and_then(Value::as_str)
         .unwrap_or("pi");
-    let awaiting_user = payload.get("awaiting_user").and_then(Value::as_str);
-    let error = payload.get("error").and_then(Value::as_str);
+    let awaiting_user = payload
+        .get("awaiting_user")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let _error = payload.get("error").and_then(Value::as_str);
 
-    update_pane_state(pane_id, "pi", |state| {
-        apply_pi_state_update(state, state_name, event_type, awaiting_user, error);
+    let _ = event_type;
+    dispatch_agent_event(AgentEvent {
+        project_id: project_id_from_current_dir()?,
+        runtime: "pi".to_string(),
+        pane_id,
+        state: state_name.to_string(),
+        awaiting_user,
     })
+}
+
+fn dispatch_agent_event(event: AgentEvent) -> Result<()> {
+    if crate::client::send_agent_event(&event).is_ok() {
+        return Ok(());
+    }
+
+    crate::daemon::agent::append_spool_record(&event)
+}
+
+fn project_id_from_current_dir() -> Result<String> {
+    let cwd = env::current_dir().context("failed to resolve current directory")?;
+    let cwd = cwd.to_string_lossy();
+    let repo_sources = load_repo_sources_from_config()?;
+    let projects = discover_projects_in(&repo_sources)?;
+    let project = best_project_for_cwd(&projects, &cwd)
+        .ok_or_else(|| anyhow!("no configured project matched current directory {cwd}"))?;
+
+    Ok(crate::project_id::project_id(project))
+}
+
+fn best_project_for_cwd<'a>(projects: &'a [ProjectEntry], cwd: &str) -> Option<&'a ProjectEntry> {
+    projects
+        .iter()
+        .filter_map(|project| {
+            let project_cwd = project.cwd.trim_end_matches('/');
+            if cwd == project_cwd {
+                return Some((project, project_cwd.len()));
+            }
+
+            cwd.strip_prefix(project_cwd)
+                .filter(|suffix| suffix.starts_with('/'))
+                .map(|_| (project, project_cwd.len()))
+        })
+        .max_by_key(|(_, match_len)| *match_len)
+        .map(|(project, _)| project)
 }
 
 fn apply_opencode_state_update(
@@ -582,14 +621,6 @@ fn apply_pi_state_update(
     state.touch(event_type);
 }
 
-fn update_pane_state<F>(pane_id: u64, source: &str, mutate: F) -> Result<()>
-where
-    F: FnOnce(&mut PaneAgentState),
-{
-    let path = state_file_path(pane_id)?;
-    update_pane_state_at_path(&path, pane_id, source, mutate)
-}
-
 fn update_pane_state_at_path<F>(path: &Path, pane_id: u64, source: &str, mutate: F) -> Result<()>
 where
     F: FnOnce(&mut PaneAgentState),
@@ -621,18 +652,6 @@ fn read_pane_state(path: &Path) -> Result<Option<PaneAgentState>> {
     let state = serde_json::from_str(&content)
         .with_context(|| format!("failed to parse {}", path.display()))?;
     Ok(Some(state))
-}
-
-fn state_file_path(pane_id: u64) -> Result<PathBuf> {
-    Ok(agent_state_dir()?.join(pane_id.to_string()))
-}
-
-fn agent_state_dir() -> Result<PathBuf> {
-    if let Ok(path) = env::var("NERVE_CENTER_DATA_DIR") {
-        return Ok(PathBuf::from(path));
-    }
-    let home = env::var("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".local/data/nerve_center"))
 }
 
 fn pane_id_from_env() -> Result<u64> {
@@ -898,8 +917,12 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::agent::AgentEvent;
+    use std::sync::Mutex;
     use std::sync::{Arc, Barrier};
     use std::thread;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_dir(name: &str) -> PathBuf {
         let unique = now_unix_ms();
@@ -1192,5 +1215,38 @@ mod tests {
             .expect("pane state should exist");
         assert_eq!(state.subagent_count, worker_count as u64);
         assert_eq!(state.effective_state, "working");
+    }
+
+    #[test]
+    fn dispatch_agent_event_spools_when_daemon_send_fails() {
+        let _env_lock = ENV_LOCK.lock().expect("env lock should not be poisoned");
+        let data_dir = test_dir("agent-spool-fallback");
+        let spool_path = data_dir.join("agent-spool.jsonl");
+        let socket_path = data_dir.join("missing.sock");
+        let event = AgentEvent {
+            project_id: "/tmp/repos/alpha".to_string(),
+            runtime: "opencode".to_string(),
+            pane_id: 42,
+            state: "working".to_string(),
+            awaiting_user: Some("question".to_string()),
+        };
+
+        unsafe {
+            env::set_var("NERVE_CENTER_DATA_DIR", &data_dir);
+            env::set_var("NERVE_CENTER_DAEMON_SOCKET", &socket_path);
+        }
+
+        dispatch_agent_event(event.clone()).expect("dispatch should fall back to spool");
+
+        unsafe {
+            env::remove_var("NERVE_CENTER_DAEMON_SOCKET");
+            env::remove_var("NERVE_CENTER_DATA_DIR");
+        }
+
+        let spool = fs::read_to_string(spool_path).expect("spool file should be readable");
+        assert_eq!(
+            spool,
+            format!("{}\n", serde_json::to_string(&event).unwrap())
+        );
     }
 }
