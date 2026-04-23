@@ -10,7 +10,7 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::daemon::agent::AgentEvent;
 use crate::daemon::protocol::{ClientMessage, ServerMessage};
@@ -54,8 +54,12 @@ impl Client {
     }
 
     pub fn connect_or_spawn() -> Result<Self> {
-        let mut stream =
-            connect_with_autostart(connect_socket, spawn_daemon_process, wait_for_socket)?;
+        let mut stream = connect_with_autostart(
+            connect_socket,
+            wait_for_existing_socket,
+            spawn_daemon_process,
+            wait_for_socket,
+        )?;
         perform_hello(&mut stream, "nerve_center")?;
 
         Ok(Self {
@@ -64,8 +68,12 @@ impl Client {
     }
 
     pub fn connect_subscription_or_spawn() -> Result<(WorkspaceSnapshot, Subscription)> {
-        let mut stream =
-            connect_with_autostart(connect_socket, spawn_daemon_process, wait_for_socket)?;
+        let mut stream = connect_with_autostart(
+            connect_socket,
+            wait_for_existing_socket,
+            spawn_daemon_process,
+            wait_for_socket,
+        )?;
         perform_hello(&mut stream, "nerve_center-tui")?;
         write_client_message(&mut stream, &ClientMessage::Subscribe)?;
 
@@ -84,8 +92,12 @@ impl Client {
 
     pub fn reconnect(&mut self) -> Result<WorkspaceSnapshot> {
         if matches!(&self.transport, ClientTransport::Unix(_)) {
-            let mut stream =
-                connect_with_autostart(connect_socket, spawn_daemon_process, wait_for_socket)?;
+            let mut stream = connect_with_autostart(
+                connect_socket,
+                wait_for_existing_socket,
+                spawn_daemon_process,
+                wait_for_socket,
+            )?;
             perform_hello(&mut stream, "nerve_center")?;
             self.transport = ClientTransport::Unix(stream);
         }
@@ -194,7 +206,7 @@ impl Subscription {
                         Ok(Err(error)) => return Err(anyhow!(error)),
                         Err(TryRecvError::Empty) => return Ok(latest),
                         Err(TryRecvError::Disconnected) => {
-                            return Err(anyhow!("daemon subscription disconnected"))
+                            return Err(anyhow!("daemon subscription disconnected"));
                         }
                     }
                 }
@@ -220,16 +232,22 @@ fn connect_socket() -> Result<UnixStream> {
         .with_context(|| format!("failed to connect to daemon socket {}", path.display()))
 }
 
-fn connect_with_autostart<C, S, W>(connect: C, spawn: S, wait: W) -> Result<UnixStream>
+fn connect_with_autostart<C, E, S, W>(
+    connect: C,
+    wait_for_existing: E,
+    spawn: S,
+    wait: W,
+) -> Result<UnixStream>
 where
     C: FnOnce() -> Result<UnixStream>,
+    E: FnOnce() -> Result<UnixStream>,
     S: FnOnce() -> Result<()>,
     W: FnOnce() -> Result<UnixStream>,
 {
     match connect() {
         Ok(stream) => Ok(stream),
         Err(initial_error) => {
-            if let Ok(stream) = wait_for_existing_socket() {
+            if let Ok(stream) = wait_for_existing() {
                 return Ok(stream);
             }
             spawn()?;
@@ -537,7 +555,7 @@ fn wait_for_socket_shutdown() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{attempt_send_agent_event, decode_server_message, Client};
+    use super::{Client, attempt_send_agent_event, decode_server_message};
     use crate::daemon::agent::AgentEvent;
     use crate::daemon::protocol::{ClientMessage, ServerMessage};
     use crate::workspace::WorkspaceSnapshot;
@@ -628,6 +646,7 @@ mod tests {
                 connect_attempts_for_connect.set(connect_attempts_for_connect.get() + 1);
                 Err(anyhow!("missing daemon"))
             },
+            || Err(anyhow!("daemon still unavailable")),
             move || {
                 spawn_calls_for_spawn.set(spawn_calls_for_spawn.get() + 1);
                 Ok(())

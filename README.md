@@ -17,7 +17,8 @@ Supported release artifacts:
 
 - Linux: `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`
 - macOS: `x86_64-apple-darwin`, `aarch64-apple-darwin`
-- Windows: `x86_64-pc-windows-msvc`
+
+Windows artifacts are not currently published because the daemon transport uses Unix domain sockets.
 
 ## Requirements
 
@@ -275,11 +276,11 @@ Notes:
 
 ## Releases
 
-Release artifacts are built with `cargo-dist` by GitHub Actions when you push a version tag such as `v0.2.0`.
+Release artifacts are built with `cargo-dist` by GitHub Actions when you push a version tag such as `v0.3.0`.
 
 Typical release flow:
 
 ```sh
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.3.0
+git push origin v0.3.0
 ```

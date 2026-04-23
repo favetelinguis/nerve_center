@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.0 - 2026-04-23
+
+### Added
+- A daemon-backed client/server architecture for workspace refresh, subscriptions, and project operations.
+- Socket-based daemon lifecycle commands and reconnect behavior for the TUI client.
+
+### Changed
+- Moved workspace coordination out of the UI path so background refreshes and operations can be handled by the daemon.
+- Release artifacts are now published for macOS and Linux only because daemon transport currently depends on Unix domain sockets.
+
+### Fixed
+- Client autostart tests now inject the existing-socket wait path instead of consulting ambient local daemon state.
+
+### Commits since 0.2.0
+- `a4d617c` update changelog for 0.1.0
+- `0e1bcaf` updated with client server architecture
+
 ## 0.2.0 - 2026-04-18
 
 ### Added
